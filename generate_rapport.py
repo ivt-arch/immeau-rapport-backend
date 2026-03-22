@@ -148,7 +148,6 @@ def delete_section_by_title(doc: Document, section_title: str):
             if section_title in text:
                 target_idx = i
                 break
-
     if target_idx is None:
         return
 
@@ -331,13 +330,102 @@ def _clear_table(tbl):
 
 
 # ─────────────────────────────────────────────
+# Gestion des photos
+# ─────────────────────────────────────────────
+
+def _replace_facade_photo(docx_bytes: bytes, new_photo_bytes: bytes) -> bytes:
+    """
+    Remplace la photo de façade (rId8 -> media/image2.jpeg) dans le DOCX.
+    Manipule directement le zip pour echanger le fichier image sans toucher au XML.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(docx_bytes), 'r') as z:
+            rels_xml = z.read('word/_rels/document.xml.rels').decode('utf-8')
+        match = re.search(r'Id="rId8"[^>]+Target="([^"]+)"', rels_xml)
+        if not match:
+            return docx_bytes
+        target = f"word/{match.group(1)}"
+        output = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(docx_bytes), 'r') as zin:
+            with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    if item.filename == target:
+                        zout.writestr(item, new_photo_bytes)
+                    else:
+                        zout.writestr(item, zin.read(item.filename))
+        return output.getvalue()
+    except Exception as e:
+        print(f"[WARN] Impossible de remplacer la photo de facade : {e}")
+        return docx_bytes
+
+
+def _insert_photos_complement(doc: Document, photos_commentees: list):
+    """
+    Insere les photos avec commentaires dans la section VI - COMPLEMENT PHOTOGRAPHIQUE.
+    Chaque entree de photos_commentees : { 'image_base64': str, 'commentaire': str }
+    """
+    if not photos_commentees:
+        return
+    body = doc.element.body
+    vi_elem = None
+    vii_elem = None
+    for elem in body:
+        if not elem.tag.endswith('}p'):
+            continue
+        text = ''.join(t.text or '' for t in elem.iter() if t.tag.endswith('}t'))
+        if 'VI' in text and 'COMPL' in text and vi_elem is None:
+            vi_elem = elem
+        elif 'VII' in text and vi_elem is not None and vii_elem is None:
+            vii_elem = elem
+            break
+    if vi_elem is None or vii_elem is None:
+        print("[WARN] Section VI-VII introuvable, photos non inserees.")
+        return
+    to_remove = []
+    elem = vi_elem.getnext()
+    while elem is not None and elem is not vii_elem:
+        text = ''.join(t.text or '' for t in elem.iter() if t.tag.endswith('}t'))
+        if not text.strip():
+            to_remove.append(elem)
+        elem = elem.getnext()
+    for e in to_remove:
+        body.remove(e)
+    for photo_data in photos_commentees:
+        image_b64 = photo_data.get('image_base64', '')
+        commentaire = photo_data.get('commentaire', '')
+        try:
+            image_bytes = base64.b64decode(image_b64)
+        except Exception:
+            continue
+        img_para = doc.add_paragraph()
+        img_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = img_para.add_run()
+        run.add_picture(io.BytesIO(image_bytes), width=Inches(5))
+        img_elem = img_para._element
+        body.remove(img_elem)
+        vii_elem.addprevious(img_elem)
+        if commentaire:
+            comment_para = doc.add_paragraph()
+            comment_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            cr = comment_para.add_run(commentaire)
+            cr.italic = True
+            comment_elem = comment_para._element
+            body.remove(comment_elem)
+            vii_elem.addprevious(comment_elem)
+        sep_para = doc.add_paragraph()
+        sep_elem = sep_para._element
+        body.remove(sep_elem)
+        vii_elem.addprevious(sep_elem)
+
+
+# ─────────────────────────────────────────────
 # Logique principale de remplissage du template
 # ─────────────────────────────────────────────
 
 def build_rapport(data: dict) -> bytes:
     """
-    Prend les données de l'app Flutter (dict JSON) et retourne
-    le contenu binaire du .docx généré.
+    Prend les donnees de l'app Flutter (dict JSON) et retourne
+    le contenu binaire du .docx genere.
     """
     doc = Document(TEMPLATE_PATH)
 
@@ -763,11 +851,6 @@ def health():
 
 @app.route("/generer_rapport", methods=["POST"])
 def generer_rapport():
-    """
-    Endpoint principal.
-    Corps : JSON avec toutes les données du projet.
-    Retourne : { "success": true } ou { "error": "..." }
-    """
     try:
         data = request.get_json(force=True)
         if not data:
@@ -780,9 +863,7 @@ def generer_rapport():
         filename = f"Rapport d'investigations {devis}.docx"
 
         send_email(docx_bytes, filename, devis, adresse)
-
-        return jsonify({"success": True, "message": f"Rapport {filename} envoyé à {MAIL_TO}"})
-
+        return jsonify({"success": True, "message": f"Rapport {filename} envoye a {MAIL_TO}"})
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -791,9 +872,6 @@ def generer_rapport():
 
 @app.route("/telecharger_rapport", methods=["POST"])
 def telecharger_rapport():
-    """
-    Variante : retourne le .docx directement (pour test ou téléchargement direct).
-    """
     from flask import send_file
     try:
         data = request.get_json(force=True)
