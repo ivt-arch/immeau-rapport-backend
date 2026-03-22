@@ -16,30 +16,41 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from lxml import etree
 import copy
 
-# Regex pour détecter les en-têtes majeurs de section (I –, II –, III –, ..., VI –, VII –, etc.)
+# Regex pour détecter les en-têtes majeurs de section (I –, II –, ..., VIII –, etc.)
 _MAJOR_SECTION_RE = re.compile(r'^[IVX]+\s+\u2013\s+')
 
 app = Flask(__name__)
-# Augmente la limite de taille des requêtes pour accepter les photos base64
 app.config['MAX_CONTENT_LENGTH'] = 80 * 1024 * 1024  # 80 MB
 
-# ─────────────────────────────────────────────
-# Configuration email via Brevo HTTP API
-# Env var à renseigner dans Render.com :
-#   BREVO_API_KEY = xkeysib-...  (Brevo → SMTP & API → Clés API)
-#   MAIL_FROM     = ivt@immeau.fr
-#   MAIL_TO       = ivt@immeau.fr
-# ─────────────────────────────────────────────
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
 MAIL_FROM = os.environ.get("MAIL_FROM", "ivt@immeau.fr")
 MAIL_TO   = os.environ.get("MAIL_TO",   "ivt@immeau.fr")
 
 TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "template.docx")
 
+W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
 
 # ─────────────────────────────────────────────
 # Helpers python-docx
 # ─────────────────────────────────────────────
+
+def _build_adresse_full(adresse: str, cp: str, ville: str) -> str:
+    """Construit l'adresse complète sans doublon (si cp/ville déjà dans adresse)."""
+    a = adresse.strip()
+    parts = [a]
+    if cp and cp.strip() and cp.strip() not in a:
+        parts.append(cp.strip())
+    if ville and ville.strip() and ville.strip().lower() not in a.lower():
+        parts.append(ville.strip())
+    return " ".join(p for p in parts if p)
+
+
+def _strip_sdc_prefix(client: str) -> str:
+    """Supprime le préfixe 'SDC DU ' ou 'SDC du ' du nom client si présent
+    (le template a déjà 'SDC DU' en texte statique)."""
+    return re.sub(r'^SDC\s+DU\s+', '', client, flags=re.IGNORECASE).strip()
+
 
 def replace_text_in_paragraph(paragraph, old: str, new: str) -> bool:
     """Remplace old par new dans un paragraphe en préservant le formatage du premier run."""
@@ -53,7 +64,9 @@ def replace_text_in_paragraph(paragraph, old: str, new: str) -> bool:
 
 
 def replace_in_doc(doc: Document, replacements: dict):
-    """Applique tous les remplacements textuels dans le document entier (paragraphes + tables)."""
+    """Applique tous les remplacements dans le document entier
+    (paragraphes + tables + en-têtes/pieds de page)."""
+    # Corps du document
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -63,6 +76,23 @@ def replace_in_doc(doc: Document, replacements: dict):
     for para in doc.paragraphs:
         for old, new in replacements.items():
             replace_text_in_paragraph(para, old, str(new))
+
+    # En-têtes et pieds de page
+    for section in doc.sections:
+        for hf in [section.header, section.footer,
+                   section.even_page_header, section.even_page_footer,
+                   section.first_page_header, section.first_page_footer]:
+            if hf is None:
+                continue
+            for para in hf.paragraphs:
+                for old, new in replacements.items():
+                    replace_text_in_paragraph(para, old, str(new))
+            for table in hf.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for para in cell.paragraphs:
+                            for old, new in replacements.items():
+                                replace_text_in_paragraph(para, old, str(new))
 
 
 def _get_para_text(elem) -> str:
@@ -78,7 +108,6 @@ def _has_underline(elem) -> bool:
 
 
 def _remove_elements(body, elements):
-    """Supprime une liste d'éléments du body du document."""
     for elem in elements:
         try:
             body.remove(elem)
@@ -88,10 +117,6 @@ def _remove_elements(body, elements):
 
 def delete_elements_by_text_range(doc: Document, start_contains: str, end_contains: str,
                                    include_start=True, include_end=True):
-    """
-    Supprime tous les éléments entre start_contains et end_contains dans le body.
-    Paramètres include_start/include_end contrôlent si les marqueurs eux-mêmes sont inclus.
-    """
     body = doc.element.body
     body_children = list(body)
 
@@ -107,7 +132,7 @@ def delete_elements_by_text_range(doc: Document, start_contains: str, end_contai
             in_range = True
             if include_start:
                 to_remove.append(elem)
-            continue  # Don't process end check on same element as start
+            continue
 
         if in_range:
             if end_contains and end_contains in text:
@@ -122,7 +147,6 @@ def delete_elements_by_text_range(doc: Document, start_contains: str, end_contai
 
 
 def delete_single_paragraph(doc: Document, contains: str):
-    """Supprime le premier paragraphe contenant contains."""
     body = doc.element.body
     for elem in list(body):
         if elem.tag.endswith("}p"):
@@ -136,11 +160,7 @@ def delete_single_paragraph(doc: Document, contains: str):
 
 
 def delete_section_by_title(doc: Document, section_title: str):
-    """
-    Supprime une section de conclusion identifiée par son titre.
-    Structure : chaque section = paragraphe numPr+underline (titre),
-    suivi de paragraphes de contenu, jusqu'au prochain numPr+underline ou table.
-    """
+    """Supprime une section de conclusion identifiée par son titre."""
     body = doc.element.body
     paras = list(body)
 
@@ -157,12 +177,10 @@ def delete_section_by_title(doc: Document, section_title: str):
     to_remove = [paras[target_idx]]
     for i in range(target_idx + 1, len(paras)):
         elem = paras[i]
-        # Arrêt impératif aux en-têtes majeurs (VI –, VII –, VIII –, etc.)
         if elem.tag.endswith("}p"):
             text = _get_para_text(elem)
             if _MAJOR_SECTION_RE.match(text):
                 break
-        # Arrêt au prochain titre de sous-section (numPr + underline)
         if elem.tag.endswith("}p") and _has_numpr(elem) and _has_underline(elem):
             break
         to_remove.append(elem)
@@ -173,8 +191,7 @@ def delete_section_by_title(doc: Document, section_title: str):
 def insert_paragraphs_before(doc: Document, anchor_contains: str, paragraphs_data: list):
     """
     Insère des paragraphes avant l'élément contenant anchor_contains.
-    paragraphs_data : liste de dicts { 'text': str, 'bold': bool }
-    L'ordre final est le même que l'ordre dans paragraphs_data.
+    paragraphs_data : liste de dicts { 'text', 'bold', 'underline', 'bullet', 'font_size' }
     """
     body = doc.element.body
     anchor = None
@@ -188,14 +205,16 @@ def insert_paragraphs_before(doc: Document, anchor_contains: str, paragraphs_dat
     last_inserted = None
     for pdata in paragraphs_data:
         new_para = doc.add_paragraph()
-        run = new_para.add_run(pdata.get('text', ''))
-        if pdata.get('bold'):
-            run.bold = True
-        if pdata.get('underline'):
-            run.underline = True
-        font_size = pdata.get('font_size')
-        if font_size:
-            run.font.size = Pt(font_size)
+        text = pdata.get('text', '').strip()
+        if pdata.get('bullet'):
+            text = f"\u2022  {text}"  # puce ronde noire + espace
+        run = new_para.add_run(text)
+        run.bold = bool(pdata.get('bold'))
+        run.underline = bool(pdata.get('underline'))
+        # Police Arial 11 systématiquement
+        run.font.name = 'Arial'
+        run.font.size = Pt(pdata.get('font_size', 11))
+
         new_elem = new_para._element
         body.remove(new_elem)
         if last_inserted is None:
@@ -205,41 +224,139 @@ def insert_paragraphs_before(doc: Document, anchor_contains: str, paragraphs_dat
         last_inserted = new_elem
 
 
+def _replace_placeholder_with_paragraphs(doc: Document, placeholder: str, text: str):
+    """
+    Remplace un paragraphe contenant un placeholder par un ou plusieurs paragraphes,
+    en splitant sur les doubles sauts de ligne (\n\n).
+    Police Arial 11 appliquée à chaque paragraphe inséré.
+    """
+    # Trouver le paragraphe cible dans le body
+    body = doc.element.body
+    target_elem = None
+    target_para = None
+    for para in doc.paragraphs:
+        if placeholder in para.text:
+            target_para = para
+            target_elem = para._element
+            break
+    if target_para is None:
+        return
+
+    # Nettoyer le texte et splitter
+    parts = [p.strip() for p in text.split('\n\n') if p.strip()]
+    if not parts:
+        replace_text_in_paragraph(target_para, placeholder, "")
+        return
+
+    # Remplacer le contenu du premier paragraphe
+    full = "".join(run.text for run in target_para.runs)
+    new_full = full.replace(placeholder, parts[0])
+    for i, run in enumerate(target_para.runs):
+        run.text = new_full if i == 0 else ""
+        run.font.name = 'Arial'
+        run.font.size = Pt(11)
+
+    # Insérer les paragraphes supplémentaires
+    last_elem = target_elem
+    for part in parts[1:]:
+        new_para = doc.add_paragraph()
+        run = new_para.add_run(part)
+        run.font.name = 'Arial'
+        run.font.size = Pt(11)
+        new_elem = new_para._element
+        body.remove(new_elem)
+        last_elem.addnext(new_elem)
+        last_elem = new_elem
+
+
+def _join_french_list(items: list) -> str:
+    """Joint une liste en français : 'a, b, c et d'."""
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " et " + items[-1]
+
+
 # ─────────────────────────────────────────────
 # Gestion des photos
 # ─────────────────────────────────────────────
 
 def _insert_facade_photo(doc: Document, facade_bytes: bytes):
-    """
-    Remplace le placeholder texte de la photo de façade (P6) par l'image fournie.
-    Le nouveau template utilise un placeholder texte, pas une image embarquée.
-    """
     FACADE_PH = "\u2018ici photo de la fa\u00e7ade en mode portrait, 9,87cm de hauteur\u2019"
     for para in doc.paragraphs:
         if FACADE_PH in para.text:
-            # Vider tous les runs du paragraphe
             for run in para.runs:
                 run.text = ""
-            # Insérer l'image dans un nouveau run
             try:
                 run = para.add_run()
                 run.add_picture(io.BytesIO(facade_bytes), height=Cm(9.87))
             except Exception as e:
                 print(f"[WARN] Erreur insertion photo façade : {e}")
             return
-    # Si placeholder non trouvé, on ignore silencieusement
+
+
+def _clear_cell_content(cell):
+    """Supprime tout le contenu textuel et les images d'une cellule,
+    en conservant uniquement les propriétés de paragraphe."""
+    for p in cell._tc.findall(f'{{{W_NS}}}p'):
+        for child in list(p):
+            if not child.tag.endswith('}pPr'):
+                p.remove(child)
+
+
+def _fill_photo_cell(doc: Document, cell, photo_data: dict):
+    """Remplace le contenu d'une cellule par une photo + commentaire."""
+    image_b64 = photo_data.get('image_base64', '')
+    commentaire = photo_data.get('commentaire', '')
+
+    # Vider entièrement la cellule (texte et images)
+    _clear_cell_content(cell)
+
+    # Utiliser le premier paragraphe pour l'image
+    para = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
+    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    try:
+        image_bytes = base64.b64decode(image_b64)
+        run = para.add_run()
+        run.add_picture(io.BytesIO(image_bytes), height=Cm(9.87))
+    except Exception as e:
+        print(f"[WARN] Erreur insertion photo : {e}")
+        para.add_run("Photo non disponible")
+
+    # Commentaire dans un paragraphe séparé
+    if commentaire:
+        comment_para = cell.add_paragraph(commentaire)
+        comment_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in comment_para.runs:
+            run.italic = True
+            run.font.name = 'Arial'
+            run.font.size = Pt(11)
+
+
+def _clear_cell(cell):
+    """Vide le contenu d'une cellule."""
+    _clear_cell_content(cell)
+
+
+def _clear_table(tbl):
+    """Vide toutes les cellules d'une table."""
+    for row in tbl.rows:
+        for cell in row.cells:
+            _clear_cell_content(cell)
 
 
 def _fill_photo_tables(doc: Document, photos_commentees: list):
     """
-    Remplit les tables de photos (Tables 5-9) avec les photos fournies.
-    Chaque table a N lignes × 2 colonnes.
+    Remplit les tables de photos (à partir de la table index 4) avec les photos fournies.
     Vide les cellules sans photo et supprime les lignes entièrement vides.
     """
     photo_idx = 0
     total_photos = len(photos_commentees)
 
-    for tbl_idx in range(5, 10):
+    # La table 4 est la table du complément photographique (section VI)
+    for tbl_idx in range(4, 9):
         if tbl_idx >= len(doc.tables):
             break
         tbl = doc.tables[tbl_idx]
@@ -247,19 +364,17 @@ def _fill_photo_tables(doc: Document, photos_commentees: list):
 
         for row_idx, row in enumerate(tbl.rows):
             row_has_photo = False
-            # Chaque ligne a 2 colonnes
             n_cols = min(2, len(row.cells))
             for col_idx in range(n_cols):
-                # Éviter les cellules fusionnées (même _tc)
                 cell = row.cells[col_idx]
                 if col_idx > 0 and row.cells[col_idx]._tc is row.cells[0]._tc:
-                    continue  # cellule fusionnée, déjà traitée
+                    continue  # cellule fusionnée
                 if photo_idx < total_photos:
                     _fill_photo_cell(doc, cell, photos_commentees[photo_idx])
                     photo_idx += 1
                     row_has_photo = True
                 else:
-                    _clear_cell(cell)
+                    _clear_cell_content(cell)
 
             if not row_has_photo:
                 rows_to_remove.append(row._tr)
@@ -272,57 +387,10 @@ def _fill_photo_tables(doc: Document, photos_commentees: list):
                 pass
 
         if photo_idx >= total_photos:
-            # Vider les tables restantes entièrement
-            for remaining_idx in range(tbl_idx + 1, 10):
+            for remaining_idx in range(tbl_idx + 1, 9):
                 if remaining_idx < len(doc.tables):
                     _clear_table(doc.tables[remaining_idx])
             break
-
-
-def _fill_photo_cell(doc: Document, cell, photo_data: dict):
-    """Remplace le contenu d'une cellule par une photo + commentaire."""
-    image_b64 = photo_data.get('image_base64', '')
-    commentaire = photo_data.get('commentaire', '')
-
-    # Vider la cellule
-    for para in cell.paragraphs:
-        for run in para.runs:
-            run.text = ""
-
-    try:
-        image_bytes = base64.b64decode(image_b64)
-        # Utiliser le premier paragraphe pour l'image
-        para = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
-        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = para.add_run()
-        run.add_picture(io.BytesIO(image_bytes), height=Cm(9.87))
-
-        # Ajouter le commentaire dans un nouveau paragraphe
-        if commentaire:
-            comment_para = cell.add_paragraph(commentaire)
-            comment_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            for run in comment_para.runs:
-                run.italic = True
-    except Exception as e:
-        print(f"[WARN] Erreur insertion photo : {e}")
-        para = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
-        para.add_run(commentaire or "Photo non disponible")
-
-
-def _clear_cell(cell):
-    """Vide le contenu d'une cellule."""
-    for para in cell.paragraphs:
-        for run in para.runs:
-            run.text = ""
-
-
-def _clear_table(tbl):
-    """Vide toutes les cellules d'une table."""
-    for row in tbl.rows:
-        for cell in row.cells:
-            _clear_cell(cell)
-
-
 
 
 # ─────────────────────────────────────────────
@@ -330,17 +398,13 @@ def _clear_table(tbl):
 # ─────────────────────────────────────────────
 
 def build_rapport(data: dict) -> bytes:
-    """
-    Prend les donnees de l'app Flutter (dict JSON) et retourne
-    le contenu binaire du .docx genere.
-    """
     doc = Document(TEMPLATE_PATH)
 
-    # ── Extraction des données ────────────────────────────────────────────
+    # ── Extraction des données ──────────────────────────────────────────
     adresse        = data.get("adresseProjet", "")
     ville          = data.get("villeProjet", "")
     cp             = data.get("cpProjet", "")
-    client         = data.get("client", "")
+    client_raw     = data.get("client", "")
     mo_delegue     = data.get("moDelegue", "")
     adresse_mo     = data.get("adresseMoDelegue", "")
     ville_mo       = data.get("villeMoDelegue", "")
@@ -356,9 +420,13 @@ def build_rapport(data: dict) -> bytes:
     titre_etude    = data.get("titreEtude", "")
     reglement      = data.get("reglementApplicable", "Ville de Paris")
 
-    adresse_full     = f"{adresse}, {cp} {ville}".strip(", ")
-    adresse_mo_full  = f"{adresse_mo}, {cp_mo} {ville_mo}".strip(", ")
-    adresse_moe_full = f"{adresse_moe}, {cp_moe} {ville_moe}".strip(", ")
+    # Adresses sans doublon
+    adresse_full     = _build_adresse_full(adresse, cp, ville)
+    adresse_mo_full  = _build_adresse_full(adresse_mo, cp_mo, ville_mo)
+    adresse_moe_full = _build_adresse_full(adresse_moe, cp_moe, ville_moe)
+
+    # Client sans préfixe "SDC DU" (déjà dans le template en texte statique)
+    client = _strip_sdc_prefix(client_raw)
 
     desc_site      = data.get("descriptionSite", "")
     parcelle       = data.get("parcelleCadastre", "")
@@ -370,18 +438,40 @@ def build_rapport(data: dict) -> bytes:
 
     # BPE
     bpe_present            = data.get("bpePresent", False)
-    bpe_type               = data.get("bpeTypeBranchement", "")       # 'ouvert', 'ferme', 'canalise'
+    bpe_type               = data.get("bpeTypeBranchement", "")
     bpe_phrase             = data.get("bpePhraseGeneree", "")
 
     # Zones canalisations
-    batiment_zones         = data.get("batimentZones", [])   # [{zoneName, appPresentes, appPhrase, entPresentes, entPhrase}]
-    cour_zones             = data.get("courZones", [])        # [{zoneName, entPresentes, entPhrase}]
+    batiment_zones         = data.get("batimentZones", [])
+    cour_zones             = data.get("courZones", [])
 
-    is_paris = cp.startswith("75")
+    # Installations sanitaires (liste d'items sélectionnés, ex. ["le siphon de sol en sous-sol"])
+    installations_items    = data.get("installationsSanitairesItems", [])
 
-    # ── 1. Remplacements dans les tables (page de garde) ──────────────────
+    # Regards de visite non étanches
+    regards_noms           = data.get("regardsNonEtanchesNoms", [])    # ex. ["R1","R2","T5"]
+    regards_texte          = data.get("regardsNonEtanchesTexte", "")   # conclusion GPT
 
-    # Table 0 : en-tête avec l'adresse
+    is_paris = cp.startswith("75") if cp else False
+
+    # ── Nettoyage de objet_mission : supprimer le préambule ───────────────
+    # La page objet_mission_page envoie "La présente étude est demandée par X.\n\nCette mission a pour objectif Y."
+    # Le template a déjà "La présente étude est demandée par le SDC du [adresse].\nCette mission a pour objectif [placeholder]."
+    # On extrait uniquement la partie objectif (après "Cette mission a pour objectif ").
+    objet_clean = objet_mission
+    m = re.search(r'Cette mission a pour objectif\s+', objet_clean, re.IGNORECASE | re.DOTALL)
+    if m:
+        objet_clean = objet_clean[m.end():].strip()
+    # Supprimer aussi "La présente étude..." si l'objectif n'est pas trouvé
+    if not m:
+        objet_clean = re.sub(
+            r'^La pr[ée]sente [ée]tude est demand[ée]e par[^.]+\.\s*',
+            '', objet_clean, flags=re.IGNORECASE
+        ).strip()
+
+    # ── 1. Remplacements dans les tables (page de garde) ─────────────────
+
+    # Table 0 : titre avec l'adresse
     tbl0 = doc.tables[0]
     for row in tbl0.rows:
         for cell in row.cells:
@@ -393,8 +483,6 @@ def build_rapport(data: dict) -> bytes:
     # Table 1 : acteurs, devis, date, rédacteur, vérificateur
     if len(doc.tables) > 1:
         tbl1 = doc.tables[1]
-        # Cellule [1,0] : MOD (cells 0 et 1 sont fusionnées → même XML)
-        # Les paragraphes sont : P0=vide, P1=nom MOD, P2=adresse MOD, P3=CP+ville MOD
         cell_mod = tbl1.rows[1].cells[0]
         for para in cell_mod.paragraphs:
             replace_text_in_paragraph(para,
@@ -405,8 +493,6 @@ def build_rapport(data: dict) -> bytes:
                 "\u2018ici code postal du MOD\u2019 \u2018ici ville MOD\u2019",
                 f"{cp_mo} {ville_mo}")
 
-        # Cellule [1,2] : MO (maître d'œuvre)
-        # Les paragraphes sont : P0=espace, P1=nom MO, P2=adresse MO, P3=CP+ville MO, P4=vide
         cell_moe = tbl1.rows[1].cells[2]
         for para in cell_moe.paragraphs:
             replace_text_in_paragraph(para,
@@ -417,7 +503,6 @@ def build_rapport(data: dict) -> bytes:
                 "\u2018ici code postal du MO\u2019 \u2018ici ville MO\u2019",
                 f"{cp_moe} {ville_moe}")
 
-        # Ligne 3 : devis, date, rédacteur, vérificateur
         row3 = tbl1.rows[3]
         replace_text_in_paragraph(row3.cells[0].paragraphs[0],
             "\u2018ici num\u00e9ro de devis\u2019", devis)
@@ -428,12 +513,12 @@ def build_rapport(data: dict) -> bytes:
         replace_text_in_paragraph(row3.cells[3].paragraphs[0],
             "\u2018ici v\u00e9rifi\u00e9 par\u2026\u2019", verificateur)
 
-    # ── 2. Remplacements dans les paragraphes fixes ───────────────────────
+    # ── 2. Remplacements globaux ──────────────────────────────────────────
     replacements = {
-        # Page de garde – SDC (le "SDC DU" est statique dans le template, on remplace uniquement le placeholder)
+        # Page de garde – SDC (le "SDC DU" est statique dans le template)
         "\u2018Client/maitre d\u2019ouvrage\u2019": client.upper(),
 
-        # Titre d'étude (P9)
+        # Titre d'étude (P9) et en-tête de page
         "\u2018ici titre d\u2019\u00e9tude\u2019": titre_etude,
 
         # Règlement (P52)
@@ -442,71 +527,81 @@ def build_rapport(data: dict) -> bytes:
         # Section I – Objet de la mission
         "\u2018adresse, code postal ville\u2019": adresse_full,
 
+        # Objet de la mission (placeholder dans P68)
+        "\u2018ce qui est coch\u00e9 ou tap\u00e9 dans la page objet de la mission\u2019": objet_clean,
+
         # Section II – Description du site (parcelle)
         "\u2018num\u00e9ro de parcelle cadastrale\u2019": parcelle,
         "\u2018section cadastrale\u2019": section_cad,
 
-        # Objet de la mission (P68)
-        "\u2018ce qui est coch\u00e9 ou tap\u00e9 dans la page objet de la mission\u2019": objet_mission,
+        # En-tête de page : 'objet de la prestation'
+        "\u2018objet de la prestation\u2019": titre_etude,
 
-        # Description du site – phrase Claude IA (P72)
-        "\u2018phrase g\u00e9n\u00e9r\u00e9e avec Claude IA sur la page description du site\u2019": desc_site,
+        # Pied de page : 'numéro de devis'
+        "\u2018num\u00e9ro de devis\u2019": devis,
     }
     replace_in_doc(doc, replacements)
 
-    # ── 3. Section IV – Paris vs Hors-Paris ───────────────────────────────
-    PARIS_MARKER    = "\u2018si rapport dans paris mettre ce paragraphe\u00a0:\u2019"
+    # ── 3. Supprimer "(si séléctionné dans l'application)" dans la table des matières ─
+    INSTR_TDM = " (si s\u00e9l\u00e9ctionn\u00e9 dans l\u2019application)"
+    INSTR_TDM2 = " (si s\u00e9l\u00e9ctionn\u00e9 dans l'application)"  # apostrophe ASCII
+    for para in doc.paragraphs:
+        for marker in [INSTR_TDM, INSTR_TDM2]:
+            if marker in para.text:
+                replace_text_in_paragraph(para, marker, "")
+
+    # ── 4. Supprimer P70 et P71 (doublons de description du site) ────────
+    # Le template a "Le site à l'étude est situé au 'adresse...'" et "(parcelle cadastrale...)"
+    # La description Claude (P72) contient déjà ces informations.
+    delete_single_paragraph(doc, "Le site \u00e0 l\u2019\u00e9tude est situ\u00e9 au \u2018adresse")
+    delete_single_paragraph(doc, "(parcelle cadastrale \u2018num\u00e9ro")
+
+    # ── 5. Description du site : remplacer le placeholder par plusieurs paragraphes ──
+    DESC_PH = "\u2018phrase g\u00e9n\u00e9r\u00e9e avec Claude IA sur la page description du site\u2019"
+    if desc_site:
+        _replace_placeholder_with_paragraphs(doc, DESC_PH, desc_site)
+    else:
+        replace_in_doc(doc, {DESC_PH: ""})
+
+    # ── 6. Section IV – Paris vs Hors-Paris ──────────────────────────────
+    PARIS_MARKER      = "\u2018si rapport dans paris mettre ce paragraphe\u00a0:\u2019"
     HORS_PARIS_MARKER = "\u2018si rapport en dehors de paris"
-    V_CONCLUSIONS   = "V \u2013 CONCLUSIONS"
+    V_CONCLUSIONS     = "V \u2013 CONCLUSIONS"
 
     if is_paris:
-        # Garder le bloc Paris, supprimer le bloc Hors-Paris
         delete_single_paragraph(doc, PARIS_MARKER)
-        # Supprimer de hors-Paris marker jusqu'à (mais non inclus) "V – CONCLUSIONS"
         delete_elements_by_text_range(doc,
             start_contains=HORS_PARIS_MARKER,
             end_contains=V_CONCLUSIONS,
-            include_start=True,
-            include_end=False)
+            include_start=True, include_end=False)
     else:
-        # Supprimer le bloc Paris (de son marker jusqu'à hors-Paris marker exclus)
         delete_elements_by_text_range(doc,
             start_contains=PARIS_MARKER,
             end_contains=HORS_PARIS_MARKER,
-            include_start=True,
-            include_end=False)
-        # Supprimer le marker hors-Paris uniquement
+            include_start=True, include_end=False)
         delete_single_paragraph(doc, HORS_PARIS_MARKER)
 
-    # ── 4. Section V – BPE (Branchement Particulier à l'Égout) ───────────
+    # ── 7. Section V – BPE ───────────────────────────────────────────────
     BPE_MARKER    = "\u2018si dans la page de l\u2019application Branchement"
     BPE_PHRASE_PH = "\u2018phrase de conclusion en fonction des cases \u00e0 cocher"
     CANALAPP_PH   = "Canalisations apparentes en caves b\u00e2timent"
 
     if not bpe_present:
-        # Supprimer tout le bloc BPE (marker + contenu jusqu'au paragraphe suivant après BPE_PHRASE_PH)
         delete_elements_by_text_range(doc,
             start_contains=BPE_MARKER,
             end_contains=CANALAPP_PH,
-            include_start=True,
-            include_end=False)
+            include_start=True, include_end=False)
     else:
-        # BPE présent : supprimer uniquement le marker (garder le titre inclus dans P113)
-        # P113 contient : marker + titre "Branchement particulier à l'égout (BPE)"
-        # On remplace le marker (+ l'espace qui suit) par vide dans ce paragraphe
         for para in doc.paragraphs:
             if "si dans la page de l" in para.text and "BPE" in para.text:
                 replace_text_in_paragraph(para,
                     "\u2018si dans la page de l\u2019application Branchement du Particulier \u00e0 l\u2019\u00e9gout on coche pr\u00e9sence d\u2019un BPE (Paris)\u00a0: oui faire apparaitre ce titre et le texte ci dessous\u00a0:\u2019 ",
                     "")
-                # Si le marqueur existe sans espace après :
                 replace_text_in_paragraph(para,
                     "\u2018si dans la page de l\u2019application Branchement du Particulier \u00e0 l\u2019\u00e9gout on coche pr\u00e9sence d\u2019un BPE (Paris)\u00a0: oui faire apparaitre ce titre et le texte ci dessous\u00a0:\u2019",
                     "")
                 break
 
-        # Gestion des schémas : garder uniquement celui correspondant au type
-        # Fermé : P119-P124 | Ouvert : P126-P131 | Canalisé : P134-P138
         FERME_SCHEMA_CAPTION  = "Sch\u00e9ma de principe du branchement particulier ferm\u00e9"
         OUVERT_SCHEMA_CAPTION = "Sch\u00e9ma de principe du branchement particulier ouvert"
         CANAL_SCHEMA_CAPTION  = "Sch\u00e9ma de principe du branchement particulier canalis\u00e9"
@@ -515,7 +610,6 @@ def build_rapport(data: dict) -> bytes:
         CANAL_INSTR  = "\u2018mettre le sch\u00e9ma et la l\u00e9gende ci dessus si dans la page branchement du particulier \u00e0 l\u2019\u00e9gout on coche BPE canalis\u00e9\u2019"
 
         if bpe_type == 'ferme':
-            # Garder fermé, supprimer ouvert et canalisé
             delete_single_paragraph(doc, FERME_INSTR)
             delete_elements_by_text_range(doc,
                 start_contains=OUVERT_SCHEMA_CAPTION,
@@ -525,9 +619,7 @@ def build_rapport(data: dict) -> bytes:
                 start_contains=CANAL_SCHEMA_CAPTION,
                 end_contains=CANAL_INSTR,
                 include_start=True, include_end=True)
-            # Supprimer aussi les lignes vides orphelines entre les schémas
         elif bpe_type == 'ouvert':
-            # Garder ouvert, supprimer fermé et canalisé
             delete_elements_by_text_range(doc,
                 start_contains=FERME_SCHEMA_CAPTION,
                 end_contains=FERME_INSTR,
@@ -538,7 +630,6 @@ def build_rapport(data: dict) -> bytes:
                 end_contains=CANAL_INSTR,
                 include_start=True, include_end=True)
         elif bpe_type == 'canalise':
-            # Garder canalisé, supprimer fermé et ouvert
             delete_elements_by_text_range(doc,
                 start_contains=FERME_SCHEMA_CAPTION,
                 end_contains=FERME_INSTR,
@@ -549,7 +640,6 @@ def build_rapport(data: dict) -> bytes:
                 include_start=True, include_end=True)
             delete_single_paragraph(doc, CANAL_INSTR)
         else:
-            # Type non défini : supprimer tous les schémas
             delete_elements_by_text_range(doc,
                 start_contains=FERME_SCHEMA_CAPTION,
                 end_contains=FERME_INSTR,
@@ -563,70 +653,58 @@ def build_rapport(data: dict) -> bytes:
                 end_contains=CANAL_INSTR,
                 include_start=True, include_end=True)
 
-        # Insérer la phrase BPE générée par Claude
         for para in doc.paragraphs:
             if BPE_PHRASE_PH.split('\u00e0')[0][1:] in para.text:
-                replace_text_in_paragraph(para,
-                    para.text,
-                    bpe_phrase)
+                replace_text_in_paragraph(para, para.text, bpe_phrase)
                 break
 
-    # ── 5. Section V – Zones de canalisations ─────────────────────────────
-    # Supprimer les paragraphes génériques (143-151) et insérer les vrais
-    CANALAPP_GENERIC  = "Canalisations apparentes en caves b\u00e2timent \u2026."
-    CANALENT_BAT      = "Canalisations enterr\u00e9es sous b\u00e2timent"
-    CANALENT_EXT      = "Canalisations enterr\u00e9es sous espaces exterieurs"
-    CANALAPP_PHRASE   = "\u2018phrase de conclusion g\u00e9n\u00e9r\u00e9e par Claude IA\u2019"
-    CANALAPP_INSTR    = "\u2018faire plusieurs paragraphes si il y"
-    CANALENT_INSTR    = "\u2018faire plusieurs paragraphes si il y"
-
-    # Supprimer les 3 blocs génériques (apparentes bat, enterrées bat, enterrées ext)
-    # On les supprime du premier (CANALAPP_GENERIC) jusqu'au titre de conclusion suivant (Colonne EP)
+    # ── 8. Section V – Zones de canalisations ───────────────────────────
+    CANALAPP_GENERIC = "Canalisations apparentes en caves b\u00e2timent \u2026."
     COLONNE_EP_TITLE = "Colonne d\u2019eaux pluviales de fa\u00e7ade"
 
     delete_elements_by_text_range(doc,
         start_contains=CANALAPP_GENERIC,
         end_contains=COLONNE_EP_TITLE,
-        include_start=True,
-        include_end=False)
+        include_start=True, include_end=False)
 
-    # Insérer les paragraphes de zones avant le premier titre de conclusion (Colonne EP)
-    # ou avant "V – CONCLUSIONS" si aucune conclusion
     zone_paragraphs = []
-
     show_app = "Canalisations Apparentes" in paragraphes
     show_ent = "Canalisations Enterrées" in paragraphes
 
-    # Bâtiments
     for zone in batiment_zones:
-        zone_name = zone.get("zoneName", "Bâtiment")
-        app_presentes = zone.get("appPresentes", False)
-        app_phrase    = zone.get("appPhrase", "")
-        ent_presentes = zone.get("entPresentes", False)
-        ent_phrase    = zone.get("entPhrase", "")
+        zone_name  = zone.get("zoneName", "Bâtiment")
+        app_phrase = zone.get("appPhrase", "").strip()
+        ent_phrase = zone.get("entPhrase", "").strip()
 
-        if show_app and app_presentes and app_phrase:
-            zone_paragraphs.append({'text': f"Canalisations apparentes en caves {zone_name}", 'bold': True, 'underline': True})
+        if show_app and zone.get("appPresentes") and app_phrase:
+            zone_paragraphs.append({
+                'text': f"Canalisations apparentes en caves {zone_name}",
+                'bold': True, 'underline': True, 'bullet': True
+            })
             zone_paragraphs.append({'text': app_phrase, 'bold': False})
 
-        if show_ent and ent_presentes and ent_phrase:
-            zone_paragraphs.append({'text': f"Canalisations enterr\u00e9es sous {zone_name}", 'bold': True, 'underline': True})
+        if show_ent and zone.get("entPresentes") and ent_phrase:
+            zone_paragraphs.append({
+                'text': f"Canalisations enterr\u00e9es sous {zone_name}",
+                'bold': True, 'underline': True, 'bullet': True
+            })
             zone_paragraphs.append({'text': ent_phrase, 'bold': False})
 
-    # Cours
     for zone in cour_zones:
-        zone_name = zone.get("zoneName", "espace extérieur")
-        ent_presentes = zone.get("entPresentes", False)
-        ent_phrase    = zone.get("entPhrase", "")
+        zone_name  = zone.get("zoneName", "espace extérieur")
+        ent_phrase = zone.get("entPhrase", "").strip()
 
-        if show_ent and ent_presentes and ent_phrase:
-            zone_paragraphs.append({'text': f"Canalisations enterr\u00e9es sous espaces ext\u00e9rieurs ({zone_name})", 'bold': True, 'underline': True})
+        if show_ent and zone.get("entPresentes") and ent_phrase:
+            zone_paragraphs.append({
+                'text': f"Canalisations enterr\u00e9es sous espaces ext\u00e9rieurs ({zone_name})",
+                'bold': True, 'underline': True, 'bullet': True
+            })
             zone_paragraphs.append({'text': ent_phrase, 'bold': False})
 
     if zone_paragraphs:
-        # Insérer avant le premier titre de conclusion (ou avant VI si aucun)
         anchor = None
-        for candidate in [COLONNE_EP_TITLE, "Regard de limite de propri\u00e9t\u00e9",
+        for candidate in [COLONNE_EP_TITLE,
+                           "Regard de limite de propri\u00e9t\u00e9",
                            "Installations sanitaires en sous-sol",
                            "Ancienne fosse d\u2019aisance",
                            "Regards de visite non \u00e9tanches",
@@ -640,12 +718,10 @@ def build_rapport(data: dict) -> bytes:
                     break
             if anchor:
                 break
-
         if anchor:
             insert_paragraphs_before(doc, anchor, zone_paragraphs)
 
-    # ── 6. Sections de conclusions – supprimer les non sélectionnées ──────
-    # Map : chaîne Flutter exacte → extrait du titre dans le template
+    # ── 9. Sections de conclusions – supprimer les non sélectionnées ─────
     SECTION_MAP = {
         "Colonne d\u2019eaux pluviales de fa\u00e7ade":               "Colonne d\u2019eaux pluviales de fa\u00e7ade",
         "Regard de limite de propri\u00e9t\u00e9":                    "Regard de limite de propri\u00e9t\u00e9",
@@ -657,41 +733,58 @@ def build_rapport(data: dict) -> bytes:
         "Cas des eaux \u2013 Garages & Stations de lavage":           "Cas des eaux provenant des garages",
     }
 
-    # "Ventilations des réseaux" est lié à "Réseau séparatif"
     keep_ventilation = "R\u00e9seau s\u00e9paratif" in reglementations
-
     for flutter_key, template_title in SECTION_MAP.items():
         if flutter_key not in reglementations:
             delete_section_by_title(doc, template_title)
-
     if not keep_ventilation:
         delete_section_by_title(doc, "Ventilations des r\u00e9seaux")
 
-    # ── 7. Supprimer les instructions résiduelles dans les titres ─────────
-    # Les titres de sections de conclusion contiennent des instructions en smart quotes
-    # qu'il faut supprimer si la section est gardée
+    # ── 10. Supprimer instructions résiduelles dans les titres ───────────
     for para in doc.paragraphs:
         if _has_numpr(para._element) and _has_underline(para._element):
-            t = para.text
-            # Supprimer la partie instruction (entre \u2018 et fin de phrase)
-            # En remplaçant le placeholder d'instruction
             for instr_marker in [
                 " \u2018int\u00e9grer ce paragraphe si coch\u00e9 dans selection des paragraphes\u2019",
                 "\u2018int\u00e9grer ce paragraphe si coch\u00e9 dans selection des paragraphes\u2019",
             ]:
-                if instr_marker in t:
+                if instr_marker in para.text:
                     replace_text_in_paragraph(para, instr_marker, "")
                     break
 
-    # ── 8. Règlement d'assainissement ─────────────────────────────────────
-    # (garder le texte d'origine si règlement = Paris, sinon adapter)
+    # ── 11. Règlement d'assainissement ───────────────────────────────────
     if reglement and "Paris" not in reglement:
         replace_in_doc(doc, {
             "r\u00e8glement d\u2019assainissement de la ville de Paris":
                 f"r\u00e8glement d\u2019assainissement de {reglement}",
         })
 
-    # ── 9. Photo de façade (placeholder texte P6 → image) ────────────────
+    # ── 12. Installations sanitaires en sous-sol ─────────────────────────
+    # Remplace le "x" final dans "la mise en place d'un clapet anti-retour sera nécessaire pour : x."
+    if installations_items:
+        items_text = _join_french_list(installations_items)
+        replace_in_doc(doc, {
+            "pour : x.": f"pour : {items_text}."
+        })
+    # Si aucun item, laisser le placeholder tel quel (à corriger manuellement)
+
+    # ── 13. Regards de visite non étanches ──────────────────────────────
+    if regards_noms:
+        noms_text = _join_french_list(regards_noms)
+        replace_in_doc(doc, {
+            "Les regards de visite x n\u2019\u00e9tant":
+                f"Les regards de visite {noms_text} n\u2019\u00e9tant"
+        })
+    if regards_texte:
+        # Replace "il conviendra de les reprendre. X." by the GPT conclusion
+        replace_in_doc(doc, {
+            "il conviendra de les reprendre. X.":
+                f"il conviendra de les reprendre. {regards_texte}"
+        })
+    else:
+        # Juste supprimer le " X." orphelin
+        replace_in_doc(doc, {" X.": "."})
+
+    # ── 14. Photo de façade ──────────────────────────────────────────────
     FACADE_PH = "\u2018ici photo de la fa\u00e7ade en mode portrait, 9,87cm de hauteur\u2019"
     photo_facade_b64 = data.get("photoFacade")
     if photo_facade_b64:
@@ -701,17 +794,16 @@ def build_rapport(data: dict) -> bytes:
         except Exception as e:
             print(f"[WARN] Erreur décodage photo façade : {e}")
     else:
-        # Effacer le placeholder si aucune photo fournie
         for para in doc.paragraphs:
             if FACADE_PH in para.text:
                 replace_text_in_paragraph(para, FACADE_PH, "")
                 break
 
-    # ── 10. Photos avec commentaires (section VI) ─────────────────────────
+    # ── 15. Photos avec commentaires (section VI) ────────────────────────
     photos_commentees = data.get("photosCommentees", [])
     _fill_photo_tables(doc, photos_commentees)
 
-    # ── 11. Sérialise en mémoire ──────────────────────────────────────────
+    # ── 16. Sérialise en mémoire ─────────────────────────────────────────
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
@@ -722,7 +814,6 @@ def build_rapport(data: dict) -> bytes:
 # ─────────────────────────────────────────────
 
 def send_email(docx_bytes: bytes, filename: str, devis: str, adresse: str):
-    """Envoie le .docx via l'API HTTP Brevo (pas de SMTP, pas de blocage réseau)."""
     if not BREVO_API_KEY:
         raise Exception("BREVO_API_KEY manquante dans les variables d'environnement")
 
@@ -763,7 +854,6 @@ def health():
 
 @app.route("/generer_rapport", methods=["POST"])
 def generer_rapport():
-    # Lire le JSON dans le contexte de la requête AVANT de spawner le thread
     data = request.get_json(force=True)
     if not data:
         return jsonify({"error": "Corps JSON manquant"}), 400
@@ -773,7 +863,6 @@ def generer_rapport():
     filename = f"Rapport d'investigations {devis}.docx"
 
     def process_and_send():
-        """Génère le rapport et envoie le mail en arrière-plan."""
         try:
             docx_bytes = build_rapport(data)
             send_email(docx_bytes, filename, devis, adresse)
@@ -783,7 +872,6 @@ def generer_rapport():
             traceback.print_exc()
             print(f"[ERROR] Échec génération rapport {filename} : {e}")
 
-    # Lancer la génération en arrière-plan — répondre immédiatement
     thread = threading.Thread(target=process_and_send, daemon=True)
     thread.start()
 
