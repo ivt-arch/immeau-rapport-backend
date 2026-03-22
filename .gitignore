@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+modele_unpacked/
+exemple_rapport_genere.docx
+.env
