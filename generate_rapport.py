@@ -8,6 +8,7 @@ import re
 import os
 import io
 import base64
+import threading
 import requests as req_lib
 from docx import Document
 from docx.shared import Pt, Inches, Cm
@@ -762,23 +763,34 @@ def health():
 
 @app.route("/generer_rapport", methods=["POST"])
 def generer_rapport():
-    try:
-        data = request.get_json(force=True)
-        if not data:
-            return jsonify({"error": "Corps JSON manquant"}), 400
+    # Lire le JSON dans le contexte de la requête AVANT de spawner le thread
+    data = request.get_json(force=True)
+    if not data:
+        return jsonify({"error": "Corps JSON manquant"}), 400
 
-        docx_bytes = build_rapport(data)
+    devis    = data.get("devis", "00000")
+    adresse  = data.get("adresseProjet", "")
+    filename = f"Rapport d'investigations {devis}.docx"
 
-        devis    = data.get("devis", "00000")
-        adresse  = data.get("adresseProjet", "")
-        filename = f"Rapport d'investigations {devis}.docx"
+    def process_and_send():
+        """Génère le rapport et envoie le mail en arrière-plan."""
+        try:
+            docx_bytes = build_rapport(data)
+            send_email(docx_bytes, filename, devis, adresse)
+            print(f"[OK] Rapport {filename} envoyé à {MAIL_TO}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[ERROR] Échec génération rapport {filename} : {e}")
 
-        send_email(docx_bytes, filename, devis, adresse)
-        return jsonify({"success": True, "message": f"Rapport {filename} envoye a {MAIL_TO}"})
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+    # Lancer la génération en arrière-plan — répondre immédiatement
+    thread = threading.Thread(target=process_and_send, daemon=True)
+    thread.start()
+
+    return jsonify({
+        "success": True,
+        "message": f"Rapport {filename} en cours de génération. Vous recevrez un e-mail à {MAIL_TO} dans quelques instants.",
+    })
 
 
 @app.route("/telecharger_rapport", methods=["POST"])
