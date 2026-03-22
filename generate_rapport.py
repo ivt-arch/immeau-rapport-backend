@@ -43,7 +43,10 @@ def _build_adresse_full(adresse: str, cp: str, ville: str) -> str:
         parts.append(cp.strip())
     if ville and ville.strip() and ville.strip().lower() not in a.lower():
         parts.append(ville.strip())
-    return " ".join(p for p in parts if p)
+    # Première partie = adresse, reste = CP + ville séparés par une virgule
+    if len(parts) == 1:
+        return parts[0]
+    return parts[0] + ", " + " ".join(parts[1:])
 
 
 def _strip_sdc_prefix(client: str) -> str:
@@ -313,7 +316,13 @@ def _fill_photo_cell(doc: Document, cell, photo_data: dict):
     # Vider entièrement la cellule (texte et images)
     _clear_cell_content(cell)
 
-    # Utiliser le premier paragraphe pour l'image
+    # Supprimer tous les paragraphes sauf le premier pour éviter les lignes vides
+    tc = cell._tc
+    all_paras = tc.findall(f'{{{W_NS}}}p')
+    for p in all_paras[1:]:
+        tc.remove(p)
+
+    # Utiliser le premier (et maintenant unique) paragraphe pour l'image
     para = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
     para.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
@@ -325,7 +334,7 @@ def _fill_photo_cell(doc: Document, cell, photo_data: dict):
         print(f"[WARN] Erreur insertion photo : {e}")
         para.add_run("Photo non disponible")
 
-    # Commentaire dans un paragraphe séparé
+    # Commentaire directement dans le paragraphe suivant (sans ligne vide intermédiaire)
     if commentaire:
         comment_para = cell.add_paragraph(commentaire)
         comment_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -452,6 +461,23 @@ def build_rapport(data: dict) -> bytes:
     regards_noms           = data.get("regardsNonEtanchesNoms", [])    # ex. ["R1","R2","T5"]
     regards_texte          = data.get("regardsNonEtanchesTexte", "")   # conclusion GPT
 
+    # Commentaires réglementaires
+    commentaire_colonne_ep     = data.get("commentaireColonneEP", "")
+    commentaire_regard_limite  = data.get("commentaireRegardLimite", "regard de visite maçonné")
+    fosse_profondeur           = data.get("fosseProfondeur", "")
+    fosse_trappe               = data.get("fosseTrappe", False)
+    commentaire_separatif      = data.get("commentaireSeparatif", "")
+    commentaire_restaurants    = data.get("commentaireRestaurants", "")
+    commentaire_garages        = data.get("commentaireGarages", "")
+
+    # Conditions de travaux
+    cond_colonne_ep      = data.get("condTravauxColonneEP", False)
+    cond_terrassement    = data.get("condTravauxTerrassement", "")
+    cond_profondeur      = data.get("condTravauxProfondeur", "")
+    cond_sol             = data.get("condTravauxSol", "")
+    cond_difficulte      = data.get("condTravauxDifficulte", "")
+    cond_pave            = data.get("condTravauxPave", False)
+
     is_paris = cp.startswith("75") if cp else False
 
     # ── Nettoyage de objet_mission : supprimer le préambule ───────────────
@@ -468,6 +494,14 @@ def build_rapport(data: dict) -> bytes:
             r'^La pr[ée]sente [ée]tude est demand[ée]e par[^.]+\.\s*',
             '', objet_clean, flags=re.IGNORECASE
         ).strip()
+    # Supprimer les sauts de ligne (causent des espaces larges avec texte justifié)
+    objet_clean = objet_clean.replace('\n', ' ').replace('  ', ' ').strip()
+
+    # ── 0. Supprimer P70/P71 AVANT les remplacements globaux ────────────
+    # Ces paragraphes contiennent les placeholders 'adresse et 'numéro qui
+    # seraient écrasés par l'étape 2 avant de pouvoir être supprimés.
+    delete_single_paragraph(doc, "Le site \u00e0 l\u2019\u00e9tude est situ\u00e9 au \u2018adresse")
+    delete_single_paragraph(doc, "(parcelle cadastrale \u2018num\u00e9ro")
 
     # ── 1. Remplacements dans les tables (page de garde) ─────────────────
 
@@ -550,18 +584,19 @@ def build_rapport(data: dict) -> bytes:
             if marker in para.text:
                 replace_text_in_paragraph(para, marker, "")
 
-    # ── 4. Supprimer P70 et P71 (doublons de description du site) ────────
-    # Le template a "Le site à l'étude est situé au 'adresse...'" et "(parcelle cadastrale...)"
-    # La description Claude (P72) contient déjà ces informations.
-    delete_single_paragraph(doc, "Le site \u00e0 l\u2019\u00e9tude est situ\u00e9 au \u2018adresse")
-    delete_single_paragraph(doc, "(parcelle cadastrale \u2018num\u00e9ro")
-
-    # ── 5. Description du site : remplacer le placeholder par plusieurs paragraphes ──
+    # ── 4. Description du site : remplacer le placeholder par plusieurs paragraphes ──
     DESC_PH = "\u2018phrase g\u00e9n\u00e9r\u00e9e avec Claude IA sur la page description du site\u2019"
     if desc_site:
         _replace_placeholder_with_paragraphs(doc, DESC_PH, desc_site)
     else:
         replace_in_doc(doc, {DESC_PH: ""})
+
+    # ── 4b. Supprimer les \n initiaux dans la Section IV (Section IV a des ──
+    # paragraphes qui commencent par \n, créant des espaces visuels indésirables)
+    replace_in_doc(doc, {
+        "\nLe plan de la cour": "Le plan de la cour",
+        "\nLe plan du sous-sol": "Le plan du sous-sol",
+    })
 
     # ── 6. Section IV – Paris vs Hors-Paris ──────────────────────────────
     PARIS_MARKER      = "\u2018si rapport dans paris mettre ce paragraphe\u00a0:\u2019"
@@ -610,13 +645,11 @@ def build_rapport(data: dict) -> bytes:
         CANAL_INSTR  = "\u2018mettre le sch\u00e9ma et la l\u00e9gende ci dessus si dans la page branchement du particulier \u00e0 l\u2019\u00e9gout on coche BPE canalis\u00e9\u2019"
 
         if bpe_type == 'ferme':
-            delete_single_paragraph(doc, FERME_INSTR)
+            # Supprimer depuis FERME_INSTR jusqu'à CANAL_INSTR (inclus)
+            # Cela supprime les images et légendes des schémas ouvert et canalisé
+            # tout en conservant les schémas fermé (P118-P123)
             delete_elements_by_text_range(doc,
-                start_contains=OUVERT_SCHEMA_CAPTION,
-                end_contains=OUVERT_INSTR,
-                include_start=True, include_end=True)
-            delete_elements_by_text_range(doc,
-                start_contains=CANAL_SCHEMA_CAPTION,
+                start_contains=FERME_INSTR,
                 end_contains=CANAL_INSTR,
                 include_start=True, include_end=True)
         elif bpe_type == 'ouvert':
@@ -784,7 +817,104 @@ def build_rapport(data: dict) -> bytes:
         # Juste supprimer le " X." orphelin
         replace_in_doc(doc, {" X.": "."})
 
-    # ── 14. Photo de façade ──────────────────────────────────────────────
+    # ── 14. Remplacements règlementaires spécifiques ─────────────────────
+    # Colonne EP de façade : remplace le texte statique par le commentaire saisi
+    if commentaire_colonne_ep:
+        replace_in_doc(doc, {
+            "pas de colonne ep": commentaire_colonne_ep,
+        })
+
+    # Regard de limite de propriété : remplace "regard de visite maçonné" par l'élément choisi
+    if commentaire_regard_limite and commentaire_regard_limite != "regard de visite maçonné":
+        replace_in_doc(doc, {
+            "la mise en place d\u2019un regard de visite ma\u00e7onn\u00e9 en limite de propri\u00e9t\u00e9":
+                f"la mise en place d\u2019un {commentaire_regard_limite} en limite de propri\u00e9t\u00e9",
+        })
+
+    # Ancienne fosse d'aisance : construit la phrase dynamique
+    if fosse_profondeur:
+        trappe_phrase = " avec une trappe d\u2019acc\u00e8s" if fosse_trappe else ""
+        fosse_sentence = (
+            f"Une ancienne fosse d\u2019aisance d\u2019une profondeur de {fosse_profondeur}"
+            f" m\u00e8tres{trappe_phrase} est pr\u00e9sente."
+        )
+        replace_in_doc(doc, {
+            "Une ancienne fosse d\u2019aisance d\u2019une profondeur de 2 m\u00e8tres avec une trappe d\u2019acc\u00e8s est pr\u00e9sente.":
+                fosse_sentence,
+            "Une ancienne fosse d\u2019aisance d\u2019une profondeur de 2 m\u00e8tres avec une trappe d\u2019acc\u00e8s est pr\u00e9sente. ":
+                fosse_sentence + " ",
+        })
+
+    # Réseau séparatif : remplace P194 entièrement ou juste le "x"
+    if commentaire_separatif:
+        # Remplace le paragraphe entier avec le texte généré
+        replace_in_doc(doc, {
+            "Le r\u00e8glement d\u2019assainissement x impose, avant le raccordement au domaine public, la mise en place d\u2019un syst\u00e8me s\u00e9paratif d\u2019\u00e9vacuation des eaux us\u00e9es et pluviales.":
+                commentaire_separatif,
+        })
+    else:
+        # Juste remplacer "x" par le règlement applicable
+        reglement_court = reglement.replace("Ville de ", "").replace("ville de ", "")
+        replace_in_doc(doc, {
+            "assainissement x impose": f"assainissement de {reglement_court} impose",
+        })
+
+    # Restaurants : remplace "x." final par le commentaire
+    if commentaire_restaurants:
+        replace_in_doc(doc, {
+            "il faudra \u00e9quiper le commerce x.":
+                f"il conviendra : {commentaire_restaurants}.",
+        })
+
+    # Garages : insérer le commentaire avant la section VI si fourni
+    if commentaire_garages:
+        insert_paragraphs_before(doc, "VI \u2013 COMPL\u00c9MENT PHOTOGRAPHIQUE", [
+            {'text': f"Dans le cas pr\u00e9sent, il conviendra : {commentaire_garages}.", 'bold': False},
+        ])
+
+    # ── 15. Conditions de travaux ─────────────────────────────────────────
+    # P230 : présence d'une colonne EP (conditionnel)
+    if not cond_colonne_ep:
+        delete_single_paragraph(doc,
+            "D\u2019autre part, la mise aux normes de la colonne d\u2019eaux pluviales de fa\u00e7ade")
+
+    # P232 : type de terrassement
+    TERR_MAP = {
+        "manuel_total": "devront se faire manuellement en raison du manque d\u2019acc\u00e8s pour des engins m\u00e9caniques.",
+        "mecanique":    "pourront se faire m\u00e9caniquement.",
+        "mixte":        "devront se faire manuellement en raison du manque d\u2019acc\u00e8s pour des engins m\u00e9caniques dans certaines zones mais pourront se faire m\u00e9caniquement dans les zones o\u00f9 le ou les engins pourraient circuler.",
+    }
+    if cond_terrassement and cond_terrassement in TERR_MAP:
+        replace_in_doc(doc, {
+            "devront se faire manuellement en raison en raison du manque d\u2019acc\u00e8s pour des engins m\u00e9caniques.":
+                TERR_MAP[cond_terrassement],
+        })
+
+    # P233 : profondeur + sol + difficulté
+    if cond_profondeur or cond_sol or cond_difficulte:
+        prof_text = cond_profondeur if cond_profondeur else "1"
+        sol_text  = cond_sol if cond_sol else "remblais"
+        diff_map  = {
+            "difficile": "pourraient s\u2019av\u00e9rer difficiles et des purges de blocs anguleux pourraient \u00eatre n\u00e9cessaires.",
+            "facile":    "ne devraient pas poser de probl\u00e8mes particuliers.",
+        }
+        diff_text = diff_map.get(cond_difficulte, "ne devraient pas poser de probl\u00e8mes particuliers.")
+        new_p233 = (
+            f"La profondeur des fouilles pour la pose des canalisations devrait \u00eatre comprise entre 0 et "
+            f"{prof_text} m\u00e8tres de profondeur. Le sol attendu sur place \u00e9tant {sol_text}, "
+            f"les terrassements {diff_text}"
+        )
+        replace_in_doc(doc, {
+            "La profondeur des fouilles pour la pose des canalisations devrait \u00eatre comprise entre 0 et 1 m\u00e8tres de profondeur. Le sol attendu sur place \u00e9tant des remblais, les terrassements ne devraient pas poser de probl\u00e8mes particuliers.":
+                new_p233,
+        })
+
+    # P245-P246 : réfection du pavage (conditionnel)
+    if not cond_pave:
+        delete_single_paragraph(doc, "R\u00e9fection du pavage")
+        delete_single_paragraph(doc, "La r\u00e9fection des autobloquants devra respecter")
+
+    # ── 17. Photo de façade ──────────────────────────────────────────────
     FACADE_PH = "\u2018ici photo de la fa\u00e7ade en mode portrait, 9,87cm de hauteur\u2019"
     photo_facade_b64 = data.get("photoFacade")
     if photo_facade_b64:
@@ -799,11 +929,11 @@ def build_rapport(data: dict) -> bytes:
                 replace_text_in_paragraph(para, FACADE_PH, "")
                 break
 
-    # ── 15. Photos avec commentaires (section VI) ────────────────────────
+    # ── 18. Photos avec commentaires (section VI) ────────────────────────
     photos_commentees = data.get("photosCommentees", [])
     _fill_photo_tables(doc, photos_commentees)
 
-    # ── 16. Sérialise en mémoire ─────────────────────────────────────────
+    # ── 19. Sérialise en mémoire ─────────────────────────────────────────
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
