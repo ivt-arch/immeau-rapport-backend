@@ -8,13 +8,15 @@ import re
 import os
 import io
 import base64
-import zipfile
 import requests as req_lib
 from docx import Document
 from docx.shared import Pt, Inches, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from lxml import etree
 import copy
+
+# Regex pour détecter les en-têtes majeurs de section (I –, II –, III –, ..., VI –, VII –, etc.)
+_MAJOR_SECTION_RE = re.compile(r'^[IVX]+\s+\u2013\s+')
 
 app = Flask(__name__)
 # Augmente la limite de taille des requêtes pour accepter les photos base64
@@ -154,6 +156,12 @@ def delete_section_by_title(doc: Document, section_title: str):
     to_remove = [paras[target_idx]]
     for i in range(target_idx + 1, len(paras)):
         elem = paras[i]
+        # Arrêt impératif aux en-têtes majeurs (VI –, VII –, VIII –, etc.)
+        if elem.tag.endswith("}p"):
+            text = _get_para_text(elem)
+            if _MAJOR_SECTION_RE.match(text):
+                break
+        # Arrêt au prochain titre de sous-section (numPr + underline)
         if elem.tag.endswith("}p") and _has_numpr(elem) and _has_underline(elem):
             break
         to_remove.append(elem)
@@ -182,6 +190,8 @@ def insert_paragraphs_before(doc: Document, anchor_contains: str, paragraphs_dat
         run = new_para.add_run(pdata.get('text', ''))
         if pdata.get('bold'):
             run.bold = True
+        if pdata.get('underline'):
+            run.underline = True
         font_size = pdata.get('font_size')
         if font_size:
             run.font.size = Pt(font_size)
@@ -198,42 +208,25 @@ def insert_paragraphs_before(doc: Document, anchor_contains: str, paragraphs_dat
 # Gestion des photos
 # ─────────────────────────────────────────────
 
-def _replace_facade_photo(docx_bytes: bytes, new_photo_bytes: bytes) -> bytes:
+def _insert_facade_photo(doc: Document, facade_bytes: bytes):
     """
-    Remplace la photo de façade dans le DOCX (paragraphe P6 = première image du document).
-    Cherche la première image référencée dans document.xml et la remplace.
+    Remplace le placeholder texte de la photo de façade (P6) par l'image fournie.
+    Le nouveau template utilise un placeholder texte, pas une image embarquée.
     """
-    try:
-        with zipfile.ZipFile(io.BytesIO(docx_bytes), 'r') as z:
-            rels_xml = z.read('word/_rels/document.xml.rels').decode('utf-8')
-            doc_xml = z.read('word/document.xml').decode('utf-8')
-
-        # Trouve la première relation image dans document.xml
-        # Cherche r:embed= dans le XML du document (premier drawing)
-        embed_match = re.search(r'r:embed="(rId\d+)"', doc_xml)
-        if not embed_match:
-            return docx_bytes
-        rid = embed_match.group(1)
-
-        # Trouve le fichier cible pour ce rId
-        match = re.search(rf'Id="{rid}"[^>]+Target="([^"]+)"', rels_xml)
-        if not match:
-            return docx_bytes
-
-        target = f"word/{match.group(1)}"
-
-        output = io.BytesIO()
-        with zipfile.ZipFile(io.BytesIO(docx_bytes), 'r') as zin:
-            with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as zout:
-                for item in zin.infolist():
-                    if item.filename == target:
-                        zout.writestr(item, new_photo_bytes)
-                    else:
-                        zout.writestr(item, zin.read(item.filename))
-        return output.getvalue()
-    except Exception as e:
-        print(f"[WARN] Impossible de remplacer la photo de façade : {e}")
-        return docx_bytes
+    FACADE_PH = "\u2018ici photo de la fa\u00e7ade en mode portrait, 9,87cm de hauteur\u2019"
+    for para in doc.paragraphs:
+        if FACADE_PH in para.text:
+            # Vider tous les runs du paragraphe
+            for run in para.runs:
+                run.text = ""
+            # Insérer l'image dans un nouveau run
+            try:
+                run = para.add_run()
+                run.add_picture(io.BytesIO(facade_bytes), height=Cm(9.87))
+            except Exception as e:
+                print(f"[WARN] Erreur insertion photo façade : {e}")
+            return
+    # Si placeholder non trouvé, on ignore silencieusement
 
 
 def _fill_photo_tables(doc: Document, photos_commentees: list):
@@ -329,93 +322,6 @@ def _clear_table(tbl):
             _clear_cell(cell)
 
 
-# ─────────────────────────────────────────────
-# Gestion des photos
-# ─────────────────────────────────────────────
-
-def _replace_facade_photo(docx_bytes: bytes, new_photo_bytes: bytes) -> bytes:
-    """
-    Remplace la photo de façade (rId8 -> media/image2.jpeg) dans le DOCX.
-    Manipule directement le zip pour echanger le fichier image sans toucher au XML.
-    """
-    try:
-        with zipfile.ZipFile(io.BytesIO(docx_bytes), 'r') as z:
-            rels_xml = z.read('word/_rels/document.xml.rels').decode('utf-8')
-        match = re.search(r'Id="rId8"[^>]+Target="([^"]+)"', rels_xml)
-        if not match:
-            return docx_bytes
-        target = f"word/{match.group(1)}"
-        output = io.BytesIO()
-        with zipfile.ZipFile(io.BytesIO(docx_bytes), 'r') as zin:
-            with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as zout:
-                for item in zin.infolist():
-                    if item.filename == target:
-                        zout.writestr(item, new_photo_bytes)
-                    else:
-                        zout.writestr(item, zin.read(item.filename))
-        return output.getvalue()
-    except Exception as e:
-        print(f"[WARN] Impossible de remplacer la photo de facade : {e}")
-        return docx_bytes
-
-
-def _insert_photos_complement(doc: Document, photos_commentees: list):
-    """
-    Insere les photos avec commentaires dans la section VI - COMPLEMENT PHOTOGRAPHIQUE.
-    Chaque entree de photos_commentees : { 'image_base64': str, 'commentaire': str }
-    """
-    if not photos_commentees:
-        return
-    body = doc.element.body
-    vi_elem = None
-    vii_elem = None
-    for elem in body:
-        if not elem.tag.endswith('}p'):
-            continue
-        text = ''.join(t.text or '' for t in elem.iter() if t.tag.endswith('}t'))
-        if 'VI' in text and 'COMPL' in text and vi_elem is None:
-            vi_elem = elem
-        elif 'VII' in text and vi_elem is not None and vii_elem is None:
-            vii_elem = elem
-            break
-    if vi_elem is None or vii_elem is None:
-        print("[WARN] Section VI-VII introuvable, photos non inserees.")
-        return
-    to_remove = []
-    elem = vi_elem.getnext()
-    while elem is not None and elem is not vii_elem:
-        text = ''.join(t.text or '' for t in elem.iter() if t.tag.endswith('}t'))
-        if not text.strip():
-            to_remove.append(elem)
-        elem = elem.getnext()
-    for e in to_remove:
-        body.remove(e)
-    for photo_data in photos_commentees:
-        image_b64 = photo_data.get('image_base64', '')
-        commentaire = photo_data.get('commentaire', '')
-        try:
-            image_bytes = base64.b64decode(image_b64)
-        except Exception:
-            continue
-        img_para = doc.add_paragraph()
-        img_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = img_para.add_run()
-        run.add_picture(io.BytesIO(image_bytes), width=Inches(5))
-        img_elem = img_para._element
-        body.remove(img_elem)
-        vii_elem.addprevious(img_elem)
-        if commentaire:
-            comment_para = doc.add_paragraph()
-            comment_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            cr = comment_para.add_run(commentaire)
-            cr.italic = True
-            comment_elem = comment_para._element
-            body.remove(comment_elem)
-            vii_elem.addprevious(comment_elem)
-        sep_para = doc.add_paragraph()
-        sep_elem = sep_para._element
-        body.remove(sep_elem)
-        vii_elem.addprevious(sep_elem)
 
 
 # ─────────────────────────────────────────────
@@ -523,8 +429,8 @@ def build_rapport(data: dict) -> bytes:
 
     # ── 2. Remplacements dans les paragraphes fixes ───────────────────────
     replacements = {
-        # Page de garde – SDC
-        "SDC DU \u2018Client/maitre d\u2019ouvrage\u2019": f"SDC DU {client.upper()}",
+        # Page de garde – SDC (le "SDC DU" est statique dans le template, on remplace uniquement le placeholder)
+        "\u2018Client/maitre d\u2019ouvrage\u2019": client.upper(),
 
         # Titre d'étude (P9)
         "\u2018ici titre d\u2019\u00e9tude\u2019": titre_etude,
@@ -699,11 +605,11 @@ def build_rapport(data: dict) -> bytes:
         ent_phrase    = zone.get("entPhrase", "")
 
         if show_app and app_presentes and app_phrase:
-            zone_paragraphs.append({'text': f"Canalisations apparentes en caves {zone_name}", 'bold': True})
+            zone_paragraphs.append({'text': f"Canalisations apparentes en caves {zone_name}", 'bold': True, 'underline': True})
             zone_paragraphs.append({'text': app_phrase, 'bold': False})
 
         if show_ent and ent_presentes and ent_phrase:
-            zone_paragraphs.append({'text': f"Canalisations enterr\u00e9es sous {zone_name}", 'bold': True})
+            zone_paragraphs.append({'text': f"Canalisations enterr\u00e9es sous {zone_name}", 'bold': True, 'underline': True})
             zone_paragraphs.append({'text': ent_phrase, 'bold': False})
 
     # Cours
@@ -713,7 +619,7 @@ def build_rapport(data: dict) -> bytes:
         ent_phrase    = zone.get("entPhrase", "")
 
         if show_ent and ent_presentes and ent_phrase:
-            zone_paragraphs.append({'text': f"Canalisations enterr\u00e9es sous espaces ext\u00e9rieurs ({zone_name})", 'bold': True})
+            zone_paragraphs.append({'text': f"Canalisations enterr\u00e9es sous espaces ext\u00e9rieurs ({zone_name})", 'bold': True, 'underline': True})
             zone_paragraphs.append({'text': ent_phrase, 'bold': False})
 
     if zone_paragraphs:
@@ -784,25 +690,30 @@ def build_rapport(data: dict) -> bytes:
                 f"r\u00e8glement d\u2019assainissement de {reglement}",
         })
 
-    # ── 9. Photos avec commentaires (section VI) ──────────────────────────
-    photos_commentees = data.get("photosCommentees", [])
-    _fill_photo_tables(doc, photos_commentees)
-
-    # ── 10. Sérialise en mémoire ──────────────────────────────────────────
-    buf = io.BytesIO()
-    doc.save(buf)
-    docx_bytes = buf.getvalue()
-
-    # ── 11. Photo de façade (remplace l'image du modèle) ─────────────────
+    # ── 9. Photo de façade (placeholder texte P6 → image) ────────────────
+    FACADE_PH = "\u2018ici photo de la fa\u00e7ade en mode portrait, 9,87cm de hauteur\u2019"
     photo_facade_b64 = data.get("photoFacade")
     if photo_facade_b64:
         try:
             facade_bytes = base64.b64decode(photo_facade_b64)
-            docx_bytes = _replace_facade_photo(docx_bytes, facade_bytes)
+            _insert_facade_photo(doc, facade_bytes)
         except Exception as e:
             print(f"[WARN] Erreur décodage photo façade : {e}")
+    else:
+        # Effacer le placeholder si aucune photo fournie
+        for para in doc.paragraphs:
+            if FACADE_PH in para.text:
+                replace_text_in_paragraph(para, FACADE_PH, "")
+                break
 
-    return docx_bytes
+    # ── 10. Photos avec commentaires (section VI) ─────────────────────────
+    photos_commentees = data.get("photosCommentees", [])
+    _fill_photo_tables(doc, photos_commentees)
+
+    # ── 11. Sérialise en mémoire ──────────────────────────────────────────
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 
 # ─────────────────────────────────────────────
