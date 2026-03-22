@@ -22,9 +22,10 @@ _MAJOR_SECTION_RE = re.compile(r'^[IVX]+\s+\u2013\s+')
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 80 * 1024 * 1024  # 80 MB
 
-BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
-MAIL_FROM = os.environ.get("MAIL_FROM", "ivt@immeau.fr")
-MAIL_TO   = os.environ.get("MAIL_TO",   "ivt@immeau.fr")
+BREVO_API_KEY  = os.environ.get("BREVO_API_KEY", "")
+MAIL_FROM      = os.environ.get("MAIL_FROM", "ivt@immeau.fr")
+MAIL_TO        = os.environ.get("MAIL_TO",   "ivt@immeau.fr")
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 
 TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "template.docx")
 
@@ -940,6 +941,438 @@ def build_rapport(data: dict) -> bytes:
 
 
 # ─────────────────────────────────────────────
+# Rapport généré par Claude IA
+# ─────────────────────────────────────────────
+
+def _call_claude_api(system_prompt: str, user_prompt: str, max_tokens: int = 4000) -> str:
+    """Appelle l'API Claude Anthropic et retourne le texte."""
+    if not CLAUDE_API_KEY:
+        raise Exception("CLAUDE_API_KEY manquante dans les variables d'environnement")
+    headers = {
+        "x-api-key": CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    body = {
+        "model": "claude-sonnet-4-5",
+        "max_tokens": max_tokens,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_prompt}],
+    }
+    resp = req_lib.post("https://api.anthropic.com/v1/messages",
+                        headers=headers, json=body, timeout=90)
+    if resp.status_code == 200:
+        return resp.json()["content"][0]["text"].strip()
+    raise Exception(f"Claude API erreur {resp.status_code}: {resp.text[:300]}")
+
+
+def _add_heading_ia(doc, text: str, level: int = 1):
+    """Ajoute un titre de section (niveau 1 ou 2) en Arial gras."""
+    p = doc.add_paragraph()
+    run = p.add_run(text)
+    run.bold = True
+    run.font.name = "Arial"
+    run.font.size = Pt(13 if level == 1 else 11)
+    p.paragraph_format.space_before = Pt(14)
+    p.paragraph_format.space_after  = Pt(6)
+    return p
+
+
+def _add_body_ia(doc, text: str, bold: bool = False):
+    """Ajoute un paragraphe de corps de texte en Arial 11."""
+    if not text.strip():
+        return
+    p = doc.add_paragraph()
+    run = p.add_run(text.strip())
+    run.font.name = "Arial"
+    run.font.size = Pt(11)
+    run.bold = bold
+    p.paragraph_format.space_after = Pt(6)
+    return p
+
+
+def _add_bullet_ia(doc, text: str):
+    """Ajoute une puce (•) en Arial 11."""
+    p = doc.add_paragraph()
+    run = p.add_run(f"\u2022  {text.strip()}")
+    run.font.name = "Arial"
+    run.font.size = Pt(11)
+    p.paragraph_format.left_indent = Cm(0.5)
+    p.paragraph_format.space_after = Pt(4)
+
+
+def _add_cover_ia(doc, data: dict):
+    """Crée la page de garde du rapport IA."""
+    adresse    = data.get("adresseProjet", "")
+    cp         = data.get("cpProjet", "")
+    ville      = data.get("villeProjet", "")
+    client_raw = data.get("client", "")
+    devis      = data.get("devis", "")
+    date_r     = data.get("dateRapport", "")
+    redacteur  = data.get("redacteur", "")
+    moe        = data.get("moe", "")
+    adresse_full = _build_adresse_full(adresse, cp, ville)
+
+    # Titre
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run("RAPPORT D'INVESTIGATIONS ET DIAGNOSTIC")
+    r.bold = True; r.font.name = "Arial"; r.font.size = Pt(18)
+    doc.add_paragraph()
+
+    p2 = doc.add_paragraph()
+    p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r2 = p2.add_run("DES CANALISATIONS EN CAVES ET SOUS-COURS")
+    r2.bold = True; r2.font.name = "Arial"; r2.font.size = Pt(16)
+    doc.add_paragraph()
+
+    # Adresse
+    p3 = doc.add_paragraph()
+    p3.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r3 = p3.add_run(f"SDC DU {adresse_full.upper()}")
+    r3.bold = True; r3.font.name = "Arial"; r3.font.size = Pt(14)
+
+    doc.add_paragraph()
+    doc.add_paragraph()
+
+    # Tableau info
+    tbl = doc.add_table(rows=4, cols=2)
+    tbl.style = "Table Grid"
+    cells = [
+        ("Référence devis", devis),
+        ("Date", date_r),
+        ("Rédacteur", redacteur),
+        ("Maître d'œuvre", moe),
+    ]
+    for i, (label, value) in enumerate(cells):
+        tbl.rows[i].cells[0].paragraphs[0].add_run(label).bold = True
+        tbl.rows[i].cells[0].paragraphs[0].runs[0].font.name = "Arial"
+        tbl.rows[i].cells[0].paragraphs[0].runs[0].font.size = Pt(11)
+        tbl.rows[i].cells[1].paragraphs[0].add_run(value or "")
+        tbl.rows[i].cells[1].paragraphs[0].runs[0].font.name = "Arial"
+        tbl.rows[i].cells[1].paragraphs[0].runs[0].font.size = Pt(11)
+
+    doc.add_page_break()
+
+
+def _add_photo_tables_ia(doc, photos_commentees: list):
+    """Insère les photos dans un tableau 2 colonnes (même logique que template)."""
+    if not photos_commentees:
+        return
+    _add_heading_ia(doc, "VI – COMPLÉMENT PHOTOGRAPHIQUE", level=1)
+    n = len(photos_commentees)
+    rows = (n + 1) // 2
+    tbl = doc.add_table(rows=rows, cols=2)
+    tbl.style = "Table Grid"
+    idx = 0
+    for row in tbl.rows:
+        for cell in row.cells:
+            if idx >= n:
+                break
+            photo = photos_commentees[idx]
+            img_b64 = photo.get("image_base64", "")
+            comment = photo.get("commentaire", "")
+            if img_b64:
+                try:
+                    para = cell.paragraphs[0]
+                    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    run = para.add_run()
+                    run.add_picture(io.BytesIO(base64.b64decode(img_b64)), height=Cm(9.0))
+                except Exception as e:
+                    print(f"[WARN] Photo IA: {e}")
+            if comment:
+                cp = cell.add_paragraph(comment)
+                cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for r in cp.runs:
+                    r.italic = True; r.font.name = "Arial"; r.font.size = Pt(10)
+            idx += 1
+
+
+def build_rapport_ia(data: dict) -> bytes:
+    """
+    Génère le rapport complet en utilisant Claude IA pour rédiger tout le texte dynamique.
+    Assemble le résultat en Word avec python-docx.
+    """
+    import json as json_lib
+
+    # ── Extraction des données ─────────────────────────────────────────
+    adresse        = data.get("adresseProjet", "")
+    cp             = data.get("cpProjet", "")
+    ville          = data.get("villeProjet", "")
+    client_raw     = data.get("client", "")
+    devis          = data.get("devis", "")
+    objet_mission  = data.get("objetMission", "")
+    desc_site      = data.get("descriptionSite", "")
+    parcelle       = data.get("parcelleCadastre", "")
+    section_cad    = data.get("sectionCadastre", "")
+    reglement      = data.get("reglementApplicable", "Ville de Paris")
+    bpe_present    = data.get("bpePresent", False)
+    bpe_phrase     = data.get("bpePhraseGeneree", "")
+    batiment_zones = data.get("batimentZones", [])
+    cour_zones     = data.get("courZones", [])
+    reglementations = data.get("reglementationsSelectionnees", [])
+    photos         = data.get("photosCommentees", [])
+    photo_facade   = data.get("photoFacade", "")
+    installations_items = data.get("installationsSanitairesItems", [])
+    regards_noms   = data.get("regardsNonEtanchesNoms", [])
+    regards_texte  = data.get("regardsNonEtanchesTexte", "")
+    commentaire_colonne_ep = data.get("commentaireColonneEP", "")
+    commentaire_regard = data.get("commentaireRegardLimite", "")
+    fosse_prof     = data.get("fosseProfondeur", "")
+    fosse_trappe   = data.get("fosseTrappe", False)
+    commentaire_sep = data.get("commentaireSeparatif", "")
+    commentaire_rest = data.get("commentaireRestaurants", "")
+    commentaire_gar  = data.get("commentaireGarages", "")
+    cond_colonne_ep  = data.get("condTravauxColonneEP", False)
+    cond_terr       = data.get("condTravauxTerrassement", "")
+    cond_prof       = data.get("condTravauxProfondeur", "")
+    cond_sol        = data.get("condTravauxSol", "")
+    cond_diff       = data.get("condTravauxDifficulte", "")
+    cond_pave       = data.get("condTravauxPave", False)
+
+    adresse_full = _build_adresse_full(adresse, cp, ville)
+    client = _strip_sdc_prefix(client_raw)
+
+    # ── Nettoyage objet_mission ────────────────────────────────────────
+    objet_clean = objet_mission
+    m = re.search(r'Cette mission a pour objectif\s+', objet_clean, re.IGNORECASE | re.DOTALL)
+    if m:
+        objet_clean = objet_clean[m.end():].strip()
+    objet_clean = objet_clean.replace('\n', ' ').replace('  ', ' ').strip()
+
+    # ── Construction du contexte pour Claude ──────────────────────────
+    zones_text = ""
+    for z in batiment_zones:
+        zn = z.get("zoneName", "")
+        if z.get("appPresentes") and z.get("appPhrase"):
+            zones_text += f"\nCanalisations apparentes {zn}: {z['appPhrase']}"
+        if z.get("entPresentes") and z.get("entPhrase"):
+            zones_text += f"\nCanalisations enterrées {zn}: {z['entPhrase']}"
+    for z in cour_zones:
+        zn = z.get("zoneName", "")
+        if z.get("entPresentes") and z.get("entPhrase"):
+            zones_text += f"\nCanalisations enterrées espaces extérieurs ({zn}): {z['entPhrase']}"
+
+    regl_details = ""
+    if commentaire_colonne_ep:
+        regl_details += f"\n- Colonne EP façade : il conviendra de mettre aux normes {commentaire_colonne_ep}"
+    if commentaire_regard:
+        regl_details += f"\n- Regard limite de propriété : mise en place d'un {commentaire_regard}"
+    if fosse_prof:
+        t = " avec trappe d'accès" if fosse_trappe else ""
+        regl_details += f"\n- Ancienne fosse d'aisance : profondeur {fosse_prof}m{t}"
+    if installations_items:
+        regl_details += f"\n- Installations sanitaires sous-sol (clapet anti-retour) : {', '.join(installations_items)}"
+    if regards_noms:
+        regl_details += f"\n- Regards non étanches : {', '.join(regards_noms)}"
+        if regards_texte:
+            regl_details += f" — {regards_texte}"
+    if commentaire_sep:
+        regl_details += f"\n- Réseau séparatif : {commentaire_sep}"
+    if commentaire_rest:
+        regl_details += f"\n- Restaurants/commerces de bouche : {commentaire_rest}"
+    if commentaire_gar:
+        regl_details += f"\n- Garages/parkings : {commentaire_gar}"
+
+    travaux_text = ""
+    if cond_colonne_ep:
+        travaux_text += "\n- Des travaux sur la colonne EP de façade (domaine public, DICT nécessaires)"
+    if cond_terr:
+        terr_label = {"manuel_total": "terrassement manuel", "mecanique": "terrassement mécanique", "mixte": "terrassement mixte (manuel et mécanique)"}.get(cond_terr, cond_terr)
+        travaux_text += f"\n- Type de terrassement : {terr_label}"
+    if cond_prof:
+        travaux_text += f"\n- Profondeur des fouilles : 0 à {cond_prof} mètres"
+    if cond_sol:
+        travaux_text += f"\n- Nature du sol attendu : {cond_sol}"
+    if cond_diff:
+        diff_label = {"difficile": "terrassement difficile, purges possibles", "facile": "terrassement sans difficulté particulière"}.get(cond_diff, cond_diff)
+        travaux_text += f"\n- Difficulté : {diff_label}"
+    if cond_pave:
+        travaux_text += "\n- Présence de pavés (réfection NF P98-335)"
+
+    # ── Prompt pour Claude ─────────────────────────────────────────────
+    system_prompt = (
+        "Tu es un ingénieur expert en assainissement chez le bureau d'études Immeau. "
+        "Tu rédiges des rapports d'investigation et diagnostic de réseaux d'assainissement. "
+        "Ton style est professionnel, technique, concis, en français. "
+        "Tu réponds UNIQUEMENT avec un objet JSON valide contenant les clés demandées. "
+        "Pas de markdown autour du JSON, pas de texte avant ou après."
+    )
+
+    user_prompt = f"""
+Génère le texte de rapport pour le projet suivant :
+
+ADRESSE : {adresse_full}
+CLIENT (SDC) : {client}
+RÈGLEMENT : règlement d'assainissement de {reglement}
+OBJET DE LA MISSION : {objet_clean or "inspection télévisée des réseaux EU et EP"}
+DESCRIPTION DU SITE : {desc_site or f"Site situé au {adresse_full}, parcelle {parcelle} section {section_cad}"}
+BPE : {"présent — " + bpe_phrase if bpe_present and bpe_phrase else "non mentionné"}
+CANALISATIONS INSPECTÉES :{zones_text or " données non disponibles"}
+MESURES RÉGLEMENTAIRES À PRENDRE :{regl_details or " aucune précisée"}
+CONDITIONS DE TRAVAUX :{travaux_text or " données non disponibles"}
+
+Retourne EXACTEMENT ce JSON (toutes les clés, textes en français, style rapport technique) :
+{{
+  "objet_mission": "1 ou 2 phrases sur l'objectif de l'étude",
+  "description_site": "2-3 paragraphes décrivant le site, sa composition, ses réseaux EU/EP, séparés par \\n\\n",
+  "canalisations_intro": "1-2 phrases d'introduction à la section IV",
+  "conclusions_bpe": "{bpe_phrase or 'Aucun BPE mentionné dans ce rapport.'}",
+  "conclusions_zones": "Paragraphes décrivant l'état de chaque zone, séparés par \\n\\n",
+  "conclusions_reglements": "Paragraphes pour chaque point réglementaire, séparés par \\n\\n",
+  "conditions_travaux": "2-3 paragraphes sur les conditions de terrassement et remblayage",
+  "entretien": "1-2 phrases sur la préconisation d'entretien annuel"
+}}
+"""
+
+    # ── Appel Claude ───────────────────────────────────────────────────
+    raw = _call_claude_api(system_prompt, user_prompt, max_tokens=4000)
+    # Extraire le JSON même si Claude a ajouté du markdown
+    json_match = re.search(r'\{[\s\S]+\}', raw)
+    if not json_match:
+        raise Exception(f"Réponse Claude non valide: {raw[:200]}")
+    sections = json_lib.loads(json_match.group())
+
+    # ── Assemblage du document Word ────────────────────────────────────
+    doc = Document()
+
+    # Marges
+    for section in doc.sections:
+        section.top_margin    = Cm(2.5)
+        section.bottom_margin = Cm(2.5)
+        section.left_margin   = Cm(2.5)
+        section.right_margin  = Cm(2.5)
+
+    # ── Page de garde ──────────────────────────────────────────────────
+    _add_cover_ia(doc, data)
+
+    # ── PRÉAMBULE (statique) ───────────────────────────────────────────
+    _add_heading_ia(doc, "PRÉAMBULE", level=1)
+    _add_body_ia(doc,
+        "Chaque jour, vous utilisez de l'eau pour la vaisselle, la douche, la lessive, les WC… "
+        "Ce sont les eaux usées domestiques qui repartent dans le réseau collectif, pour être traitées "
+        "à la station d'épuration. Cette étude a pour objectif de vous fournir un rapport de synthèse "
+        "des résultats obtenus lors des investigations afin de préserver le bon fonctionnement du réseau."
+    )
+    _add_body_ia(doc, "Notre étude s'appuie sur les principaux textes suivants :")
+    _add_bullet_ia(doc, "Loi sur l'eau et les milieux aquatiques (LEMA) de décembre 2006")
+    _add_bullet_ia(doc, "Le Fascicule 70 du CCTG relatif à l'exécution des travaux d'assainissement")
+    _add_bullet_ia(doc, "Les normes et DTU en vigueur relatifs aux travaux d'assainissement")
+    _add_bullet_ia(doc, f"Le règlement d'assainissement de {reglement}")
+    doc.add_page_break()
+
+    # ── I – OBJET DE LA MISSION ────────────────────────────────────────
+    _add_heading_ia(doc, "I – OBJET DE LA MISSION", level=1)
+    _add_body_ia(doc, f"La présente étude est demandée par le SDC du {adresse_full}.")
+    _add_body_ia(doc, f"Cette mission a pour objectif {sections.get('objet_mission', objet_clean)}")
+
+    # ── II – DESCRIPTION DU SITE ───────────────────────────────────────
+    _add_heading_ia(doc, "II – DESCRIPTION DU SITE", level=1)
+    for para_text in sections.get("description_site", desc_site or "").split("\n\n"):
+        _add_body_ia(doc, para_text)
+
+    # ── III – GÉOLOGIE IN SITU (statique) ─────────────────────────────
+    _add_heading_ia(doc, "III – GÉOLOGIE IN SITU", level=1)
+    _add_body_ia(doc,
+        "D'un point de vue géologique, la parcelle se positionne sur les remblais reposant sur les "
+        "alluvions anciennes (X/Fy), couche géologique de la région parisienne. Ces formations sont "
+        "caractérisées par des remblais heterogènes pouvant dépasser 5 mètres d'épaisseur, reposant "
+        "sur des sables, graviers et limons anciens. Ces données ont été confirmées par consultation "
+        "de la Banque de Données du Sous-Sol (BRGM)."
+    )
+
+    # ── IV – CANALISATIONS INSPECTÉES ─────────────────────────────────
+    _add_heading_ia(doc, "IV – CANALISATIONS INSPECTÉES", level=1)
+    _add_body_ia(doc, sections.get("canalisations_intro",
+        "Le rapport d'inspection télévisée reprenant les caractéristiques et anomalies du réseau "
+        "est présenté en complément du présent rapport."
+    ))
+    _add_body_ia(doc,
+        "Le plan de la cour et du sous-sol avec l'ensemble des réseaux inspectés et les anomalies "
+        "observées est également fourni en complément."
+    )
+    _add_body_ia(doc, "Légende des plans :")
+    _add_bullet_ia(doc, "Tracé vert : réseaux sans défauts visibles, état relativement neuf")
+    _add_bullet_ia(doc, "Tracé orange : dégradations de revêtement avancées, non fuyards")
+    _add_bullet_ia(doc, "Tracé rouge : très dégradés, nombreux défauts, étanchéité non garantie")
+
+    # ── V – CONCLUSIONS ───────────────────────────────────────────────
+    doc.add_page_break()
+    _add_heading_ia(doc, "V – CONCLUSIONS", level=1)
+
+    if bpe_present:
+        _add_heading_ia(doc, "Branchement particulier à l'égout (BPE)", level=2)
+        _add_body_ia(doc, sections.get("conclusions_bpe", bpe_phrase))
+
+    if zones_text:
+        _add_heading_ia(doc, "Canalisations inspectées", level=2)
+        for para_text in sections.get("conclusions_zones", zones_text).split("\n\n"):
+            _add_body_ia(doc, para_text)
+
+    if regl_details or reglementations:
+        _add_heading_ia(doc, "Points réglementaires", level=2)
+        for para_text in sections.get("conclusions_reglements", regl_details).split("\n\n"):
+            _add_body_ia(doc, para_text)
+
+    # ── VI – COMPLÉMENT PHOTOGRAPHIQUE ───────────────────────────────
+    if photo_facade or photos:
+        doc.add_page_break()
+        _add_heading_ia(doc, "VI – COMPLÉMENT PHOTOGRAPHIQUE", level=1)
+        if photo_facade:
+            try:
+                p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                r = p.add_run()
+                r.add_picture(io.BytesIO(base64.b64decode(photo_facade)), height=Cm(9.87))
+                _add_body_ia(doc, "Vue de la façade de l'immeuble")
+            except Exception as e:
+                print(f"[WARN] Photo façade IA: {e}")
+        _add_photo_tables_ia(doc, photos)
+
+    # ── VII – CONDITIONS DE TRAVAUX ───────────────────────────────────
+    doc.add_page_break()
+    _add_heading_ia(doc, "VII – CONDITIONS DE TRAVAUX", level=1)
+    _add_heading_ia(doc, "Conditions d'accessibilité", level=2)
+    _add_body_ia(doc,
+        "Les travaux à réaliser sont en domaine privatif. Afin d'éventuellement pouvoir stocker "
+        "des matériaux sur une place de stationnement dans la rue, une demande d'occupation "
+        "temporaire du domaine public devra être déposée en mairie."
+    )
+    if cond_colonne_ep:
+        _add_body_ia(doc,
+            "D'autre part, la mise aux normes de la colonne d'eaux pluviales de façade nécessitera "
+            "des travaux sur le domaine public. Dans ce cas, des DICT seront à demander aux "
+            "différents concessionnaires."
+        )
+    for para_text in sections.get("conditions_travaux", "").split("\n\n"):
+        _add_body_ia(doc, para_text)
+    if cond_pave:
+        _add_heading_ia(doc, "Réfection du pavage", level=2)
+        _add_body_ia(doc,
+            "La réfection des autobloquants devra respecter la norme française NF P98-335 de mai 2007 "
+            "relative aux chaussées urbaines : Mise en œuvre des pavés et dalles en béton, des pavés "
+            "en terre cuite et des pavés et dalles en pierre naturelle."
+        )
+
+    # ── VIII – ENTRETIEN DU RÉSEAU ────────────────────────────────────
+    _add_heading_ia(doc, "VIII – ENTRETIEN DU RÉSEAU", level=1)
+    _add_body_ia(doc,
+        "Les réseaux d'assainissement et leurs ouvrages nécessitent un entretien régulier et préventif. "
+        "Les canalisations entartrées ou bouchées sont source d'odeurs désagréables et peuvent entraîner "
+        "des refoulements dans les parties privatives."
+    )
+    _add_body_ia(doc, sections.get("entretien",
+        "Nous préconisons un curage des réseaux d'évacuations à raison d'une prestation par an. "
+        "Pour toute demande ou renseignement, contactez-nous au 09 72 60 90 09."
+    ))
+
+    # ── Sérialise ─────────────────────────────────────────────────────
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────
 # Envoi du mail
 # ─────────────────────────────────────────────
 
@@ -1027,6 +1460,35 @@ def telecharger_rapport():
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/generer_rapport_ia", methods=["POST"])
+def generer_rapport_ia():
+    data = request.get_json(force=True)
+    if not data:
+        return jsonify({"error": "Corps JSON manquant"}), 400
+
+    devis    = data.get("devis", "00000")
+    adresse  = data.get("adresseProjet", "")
+    filename = f"Rapport IA {devis}.docx"
+
+    def process_and_send():
+        try:
+            docx_bytes = build_rapport_ia(data)
+            send_email(docx_bytes, filename, devis, adresse)
+            print(f"[OK] Rapport IA {filename} envoyé à {MAIL_TO}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[ERROR] Échec génération rapport IA {filename} : {e}")
+
+    thread = threading.Thread(target=process_and_send, daemon=True)
+    thread.start()
+
+    return jsonify({
+        "success": True,
+        "message": f"Rapport IA {filename} en cours de génération. Vous recevrez un e-mail à {MAIL_TO} dans quelques instants.",
+    })
 
 
 if __name__ == "__main__":
