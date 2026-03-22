@@ -640,7 +640,7 @@ def build_rapport(data: dict) -> bytes:
     # ── 6. Section IV – Paris vs Hors-Paris ──────────────────────────────
     PARIS_MARKER      = "\u2018si rapport dans paris mettre ce paragraphe\u00a0:\u2019"
     HORS_PARIS_MARKER = "\u2018si rapport en dehors de paris"
-    V_CONCLUSIONS     = "V \u2013 CONCLUSIONS"
+    V_CONCLUSIONS     = "5 \u2013 CONCLUSIONS"  # Après remplacement romain→arabe step 0a
 
     if is_paris:
         # Supprimer le marqueur Paris ET le paragraphe vide qui suit
