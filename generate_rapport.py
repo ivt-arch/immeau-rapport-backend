@@ -219,6 +219,13 @@ def insert_paragraphs_before(doc: Document, anchor_contains: str, paragraphs_dat
         run.font.name = 'Arial'
         run.font.size = Pt(pdata.get('font_size', 11))
 
+        space_before = pdata.get('space_before', 0)
+        space_after  = pdata.get('space_after', 0)
+        if space_before:
+            new_para.paragraph_format.space_before = Pt(space_before)
+        if space_after:
+            new_para.paragraph_format.space_after = Pt(space_after)
+
         new_elem = new_para._element
         body.remove(new_elem)
         if last_inserted is None:
@@ -498,7 +505,38 @@ def build_rapport(data: dict) -> bytes:
     # Supprimer les sauts de ligne (causent des espaces larges avec texte justifié)
     objet_clean = objet_clean.replace('\n', ' ').replace('  ', ' ').strip()
 
-    # ── 0. Supprimer P70/P71 AVANT les remplacements globaux ────────────
+    # ── 0a. En-têtes de section : chiffres romains → arabes + texte blanc ──
+    # Le style Heading 1 a la couleur 365F91 (bleu) ; on passe à FFFFFF (blanc)
+    h1_style = doc.styles['Heading 1']
+    rPr = h1_style._element.find(
+        './/{http://schemas.openxmlformats.org/wordprocessingml/2006/main}rPr')
+    if rPr is not None:
+        color_elem = rPr.find(
+            '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}color')
+        if color_elem is not None:
+            color_elem.set(
+                '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val',
+                'FFFFFF')
+            # Supprimer les attributs de couleur thème pour forcer le blanc
+            for attr in list(color_elem.attrib.keys()):
+                if 'theme' in attr.lower():
+                    del color_elem.attrib[attr]
+
+    # Remplacer chiffres romains par arabes dans headings ET sommaire
+    ROMAN_TO_ARABIC = [
+        ("VIII \u2013 ", "8 \u2013 "),
+        ("VII \u2013 ", "7 \u2013 "),
+        ("VI \u2013 ", "6 \u2013 "),
+        ("IV \u2013 ", "4 \u2013 "),
+        ("III \u2013 ", "3 \u2013 "),
+        ("II \u2013 ", "2 \u2013 "),
+        ("V \u2013 ", "5 \u2013 "),
+        ("I \u2013 ", "1 \u2013 "),
+    ]
+    for old_r, new_r in ROMAN_TO_ARABIC:
+        replace_in_doc(doc, {old_r: new_r})
+
+    # ── 0b. Supprimer P70/P71 AVANT les remplacements globaux ────────────
     # Ces paragraphes contiennent les placeholders 'adresse et 'numéro qui
     # seraient écrasés par l'étape 2 avant de pouvoir être supprimés.
     delete_single_paragraph(doc, "Le site \u00e0 l\u2019\u00e9tude est situ\u00e9 au \u2018adresse")
@@ -605,7 +643,12 @@ def build_rapport(data: dict) -> bytes:
     V_CONCLUSIONS     = "V \u2013 CONCLUSIONS"
 
     if is_paris:
-        delete_single_paragraph(doc, PARIS_MARKER)
+        # Supprimer le marqueur Paris ET le paragraphe vide qui suit
+        # (sinon un espace visuel indésirable apparaît sous l'en-tête IV)
+        delete_elements_by_text_range(doc,
+            start_contains=PARIS_MARKER,
+            end_contains="Le rapport d\u2019inspection t\u00e9l\u00e9vis\u00e9e",
+            include_start=True, include_end=False)
         delete_elements_by_text_range(doc,
             start_contains=HORS_PARIS_MARKER,
             end_contains=V_CONCLUSIONS,
@@ -615,7 +658,11 @@ def build_rapport(data: dict) -> bytes:
             start_contains=PARIS_MARKER,
             end_contains=HORS_PARIS_MARKER,
             include_start=True, include_end=False)
-        delete_single_paragraph(doc, HORS_PARIS_MARKER)
+        # Supprimer le marqueur Hors-Paris ET le paragraphe vide qui suit
+        delete_elements_by_text_range(doc,
+            start_contains=HORS_PARIS_MARKER,
+            end_contains="Le rapport d\u2019inspection t\u00e9l\u00e9vis\u00e9e",
+            include_start=True, include_end=False)
 
     # ── 7. Section V – BPE ───────────────────────────────────────────────
     BPE_MARKER    = "\u2018si dans la page de l\u2019application Branchement"
@@ -713,16 +760,22 @@ def build_rapport(data: dict) -> bytes:
         if show_app and zone.get("appPresentes") and app_phrase:
             zone_paragraphs.append({
                 'text': f"Canalisations apparentes en caves {zone_name}",
-                'bold': True, 'underline': True, 'bullet': True
+                'bold': True, 'underline': True, 'bullet': True,
+                'space_before': 12,
             })
-            zone_paragraphs.append({'text': app_phrase, 'bold': False})
+            zone_paragraphs.append({
+                'text': app_phrase, 'bold': False, 'space_after': 6,
+            })
 
         if show_ent and zone.get("entPresentes") and ent_phrase:
             zone_paragraphs.append({
                 'text': f"Canalisations enterr\u00e9es sous {zone_name}",
-                'bold': True, 'underline': True, 'bullet': True
+                'bold': True, 'underline': True, 'bullet': True,
+                'space_before': 12,
             })
-            zone_paragraphs.append({'text': ent_phrase, 'bold': False})
+            zone_paragraphs.append({
+                'text': ent_phrase, 'bold': False, 'space_after': 6,
+            })
 
     for zone in cour_zones:
         zone_name  = zone.get("zoneName", "espace extérieur")
@@ -731,9 +784,12 @@ def build_rapport(data: dict) -> bytes:
         if show_ent and zone.get("entPresentes") and ent_phrase:
             zone_paragraphs.append({
                 'text': f"Canalisations enterr\u00e9es sous espaces ext\u00e9rieurs ({zone_name})",
-                'bold': True, 'underline': True, 'bullet': True
+                'bold': True, 'underline': True, 'bullet': True,
+                'space_before': 12,
             })
-            zone_paragraphs.append({'text': ent_phrase, 'bold': False})
+            zone_paragraphs.append({
+                'text': ent_phrase, 'bold': False, 'space_after': 6,
+            })
 
     if zone_paragraphs:
         anchor = None
@@ -867,11 +923,16 @@ def build_rapport(data: dict) -> bytes:
                 f"il conviendra : {commentaire_restaurants}.",
         })
 
-    # Garages : insérer le commentaire avant la section VI si fourni
+    # Garages : supprimer l'instruction entre parenthèses dans le titre garages
+    replace_in_doc(doc, {
+        " \u2018int\u00e9grer ce paragraphe si coch\u00e9 dans selection des paragraphes\u2019": "",
+    })
+    # Garages : remplacer le placeholder "Dans notre cas, il faudra donc x."
     if commentaire_garages:
-        insert_paragraphs_before(doc, "VI \u2013 COMPL\u00c9MENT PHOTOGRAPHIQUE", [
-            {'text': f"Dans le cas pr\u00e9sent, il conviendra : {commentaire_garages}.", 'bold': False},
-        ])
+        replace_in_doc(doc, {
+            "Dans notre cas, il faudra donc x.":
+                f"Dans le cas pr\u00e9sent, il conviendra : {commentaire_garages}.",
+        })
 
     # ── 15. Conditions de travaux ─────────────────────────────────────────
     # P230 : présence d'une colonne EP (conditionnel)
@@ -934,7 +995,19 @@ def build_rapport(data: dict) -> bytes:
     photos_commentees = data.get("photosCommentees", [])
     _fill_photo_tables(doc, photos_commentees)
 
-    # ── 19. Sérialise en mémoire ─────────────────────────────────────────
+    # ── 19. Forcer la mise à jour des champs (numéros de page) ───────────
+    # Ajoute <w:updateFields w:val="1"/> dans les settings du document
+    # → Word recalcule PAGE et autres champs à l'ouverture
+    _W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    settings_elem = doc.settings.element
+    existing_uf = settings_elem.find(f'{{{_W}}}updateFields')
+    if existing_uf is None:
+        uf = etree.SubElement(settings_elem, f'{{{_W}}}updateFields')
+        uf.set(f'{{{_W}}}val', '1')
+    else:
+        existing_uf.set(f'{{{_W}}}val', '1')
+
+    # ── 20. Sérialise en mémoire ─────────────────────────────────────────
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
