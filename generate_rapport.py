@@ -134,6 +134,46 @@ def _has_underline(elem) -> bool:
     return any(e.tag.endswith("}u") for e in elem.iter())
 
 
+def _convert_numpr_to_manual_bullet(para, font_size=11):
+    """
+    Convertit un paragraphe de style liste Word (w:numPr) en puce manuelle •
+    identique au style des titres de canalisations insérés dynamiquement :
+    • [texte en gras souligné, Arial 11, noir]
+    Supprime aussi l'indentation héritée du style liste.
+    """
+    _W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    # Récupérer le texte brut avant de vider les runs
+    text = para.text.strip()
+
+    # Supprimer tous les runs existants
+    for r_elem in list(para._element.findall(f'{{{_W}}}r')):
+        para._element.remove(r_elem)
+
+    # Nettoyer les propriétés de liste dans pPr
+    pPr = para._element.find(f'{{{_W}}}pPr')
+    if pPr is not None:
+        for tag_name in ('numPr', 'ind'):
+            child = pPr.find(f'{{{_W}}}{tag_name}')
+            if child is not None:
+                pPr.remove(child)
+
+    # Run puce (non souligné)
+    bullet_run = para.add_run('\u2022  ')
+    bullet_run.bold = True
+    bullet_run.underline = False
+    bullet_run.font.name = 'Arial'
+    bullet_run.font.size = Pt(font_size)
+    bullet_run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+
+    # Run texte (gras + souligné)
+    text_run = para.add_run(text)
+    text_run.bold = True
+    text_run.underline = True
+    text_run.font.name = 'Arial'
+    text_run.font.size = Pt(font_size)
+    text_run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+
+
 def _remove_elements(body, elements):
     for elem in elements:
         try:
@@ -456,22 +496,32 @@ def _fill_photo_tables(doc: Document, photos_commentees: list):
                 pass
 
         if photo_idx >= total_photos:
-            # Supprimer les tables photo restantes et leurs paragraphes précédents
-            for remaining_tbl in photo_tables[tbl_pos + 1:]:
-                remaining_elem = remaining_tbl._tbl
+            # Construire la liste des tables à supprimer :
+            # - la table courante si elle est vide (total_photos=0 ou fin exacte sur une table)
+            # - toutes les tables photo restantes
+            _W_TR = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr'
+            tables_to_delete = []
+            current_tbl_elem = tbl._tbl
+            if len(current_tbl_elem.findall(_W_TR)) == 0:
+                # Table courante entièrement vidée → la supprimer aussi
+                tables_to_delete.append(tbl)
+            tables_to_delete.extend(photo_tables[tbl_pos + 1:])
+
+            for del_tbl in tables_to_delete:
+                del_elem = del_tbl._tbl
                 # Supprimer les paragraphes vides/sauts de page qui précèdent
-                prev_elem = remaining_elem.getprevious()
+                prev_elem = del_elem.getprevious()
                 while (prev_elem is not None
                        and prev_elem.tag.endswith('}p')
                        and not _get_para_text(prev_elem).strip()):
                     prev_to_del = prev_elem
                     prev_elem = prev_elem.getprevious()
                     try:
-                        body.remove(prev_to_del)
+                        prev_to_del.getparent().remove(prev_to_del)
                     except Exception:
                         pass
                 try:
-                    body.remove(remaining_elem)
+                    del_elem.getparent().remove(del_elem)
                 except Exception:
                     pass
             break
@@ -1077,6 +1127,14 @@ def build_rapport(data: dict) -> bytes:
                     replace_text_in_paragraph(para, instr_marker, "")
                     break
 
+    # ── 10b. Uniformiser les puces : convertir les titres de sections ─────
+    # Les titres du template (ex: "Regard de limite de propriété") utilisent
+    # le style liste Word (w:numPr), tandis que les titres de canalisations
+    # sont insérés avec une puce manuelle •. On aligne tout sur la puce manuelle.
+    for para in doc.paragraphs:
+        if _has_numpr(para._element) and _has_underline(para._element):
+            _convert_numpr_to_manual_bullet(para)
+
     # ── 11. Règlement d'assainissement ───────────────────────────────────
     if reglement and "Paris" not in reglement:
         replace_in_doc(doc, {
@@ -1304,18 +1362,29 @@ def build_rapport(data: dict) -> bytes:
     else:
         existing_uf.set(f'{{{_W}}}val', '1')
     # 19b. w:dirty="1" sur chaque fldChar begin dans les pieds de page
-    # → signale explicitement que la valeur en cache est périmée
+    # → signale explicitement que la valeur en cache est périmée.
+    # On efface aussi la valeur cachée (<w:t> entre "separate" et "end")
+    # pour éviter que des visionneuses PDF/e-mail affichent un numéro figé.
     for section in doc.sections:
         for hf in [section.footer, section.even_page_footer, section.first_page_footer]:
             if hf is None:
                 continue
             for para in hf.paragraphs:
+                after_separate = False
                 for elem in para._element.iter():
                     tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
                     if tag == 'fldChar':
                         fc_type = elem.get(f'{{{_W}}}fldCharType')
                         if fc_type == 'begin':
                             elem.set(f'{{{_W}}}dirty', '1')
+                            after_separate = False
+                        elif fc_type == 'separate':
+                            after_separate = True
+                        elif fc_type == 'end':
+                            after_separate = False
+                    elif tag == 't' and after_separate:
+                        # Effacer la valeur en cache (ex: "2") pour forcer le recalcul
+                        elem.text = ''
 
     # ── 20. Sérialise en mémoire ─────────────────────────────────────────
     buf = io.BytesIO()
