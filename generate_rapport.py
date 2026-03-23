@@ -233,14 +233,25 @@ def insert_paragraphs_before(doc: Document, anchor_contains: str, paragraphs_dat
     for pdata in paragraphs_data:
         new_para = doc.add_paragraph()
         text = pdata.get('text', '').strip()
+        font_size = pdata.get('font_size', 11)
+        is_bold = bool(pdata.get('bold'))
+        is_underline = bool(pdata.get('underline'))
+
         if pdata.get('bullet'):
-            text = f"\u2022  {text}"  # puce ronde noire + espace
+            # Puce dans un run séparé SANS soulignement pour ne pas sous-ligner le •
+            bullet_run = new_para.add_run("\u2022  ")
+            bullet_run.bold = is_bold
+            bullet_run.underline = False
+            bullet_run.font.name = 'Arial'
+            bullet_run.font.size = Pt(font_size)
+            bullet_run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+
         run = new_para.add_run(text)
-        run.bold = bool(pdata.get('bold'))
-        run.underline = bool(pdata.get('underline'))
+        run.bold = is_bold
+        run.underline = is_underline
         # Police Arial 11 systématiquement + couleur noir explicite (évite héritage rouge)
         run.font.name = 'Arial'
-        run.font.size = Pt(pdata.get('font_size', 11))
+        run.font.size = Pt(font_size)
         run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
 
         space_before = pdata.get('space_before', 0)
