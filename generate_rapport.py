@@ -67,6 +67,29 @@ def replace_text_in_paragraph(paragraph, old: str, new: str) -> bool:
     return True
 
 
+_FIELD_TAGS = frozenset([
+    '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}fldChar',
+    '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}instrText',
+])
+
+
+def replace_text_in_paragraph_safe(paragraph, old: str, new: str) -> bool:
+    """Remplace old par new dans un paragraphe en ne touchant que les runs
+    sans éléments de champ (fldChar, instrText). Préserve les champs PAGE/DATE."""
+    # Identifier les runs "purs" (pas de fldChar ni instrText)
+    safe_runs = [
+        run for run in paragraph.runs
+        if not any(child.tag in _FIELD_TAGS for child in run._r)
+    ]
+    full = "".join(run.text for run in safe_runs)
+    if old not in full:
+        return False
+    new_full = full.replace(old, new)
+    for i, run in enumerate(safe_runs):
+        run.text = new_full if i == 0 else ""
+    return True
+
+
 def replace_in_doc(doc: Document, replacements: dict):
     """Applique tous les remplacements dans le document entier
     (paragraphes + tables + en-têtes/pieds de page)."""
@@ -81,7 +104,7 @@ def replace_in_doc(doc: Document, replacements: dict):
         for old, new in replacements.items():
             replace_text_in_paragraph(para, old, str(new))
 
-    # En-têtes et pieds de page
+    # En-têtes et pieds de page : utilise la version sécurisée pour préserver les champs
     for section in doc.sections:
         for hf in [section.header, section.footer,
                    section.even_page_header, section.even_page_footer,
@@ -90,13 +113,13 @@ def replace_in_doc(doc: Document, replacements: dict):
                 continue
             for para in hf.paragraphs:
                 for old, new in replacements.items():
-                    replace_text_in_paragraph(para, old, str(new))
+                    replace_text_in_paragraph_safe(para, old, str(new))
             for table in hf.tables:
                 for row in table.rows:
                     for cell in row.cells:
                         for para in cell.paragraphs:
                             for old, new in replacements.items():
-                                replace_text_in_paragraph(para, old, str(new))
+                                replace_text_in_paragraph_safe(para, old, str(new))
 
 
 def _get_para_text(elem) -> str:
@@ -823,12 +846,11 @@ def build_rapport(data: dict) -> bytes:
         "Cas des eaux \u2013 Garages & Stations de lavage":           "Cas des eaux provenant des garages",
     }
 
-    keep_ventilation = "R\u00e9seau s\u00e9paratif" in reglementations
     for flutter_key, template_title in SECTION_MAP.items():
         if flutter_key not in reglementations:
             delete_section_by_title(doc, template_title)
-    if not keep_ventilation:
-        delete_section_by_title(doc, "Ventilations des r\u00e9seaux")
+    # Ventilations des r\u00e9seaux : toujours supprim\u00e9e (page retir\u00e9e de l\u2019application)
+    delete_section_by_title(doc, "Ventilations des r\u00e9seaux")
 
     # ── 10. Supprimer instructions résiduelles dans les titres ───────────
     for para in doc.paragraphs:
@@ -849,30 +871,56 @@ def build_rapport(data: dict) -> bytes:
         })
 
     # ── 12. Installations sanitaires en sous-sol ─────────────────────────
-    # Remplace le "x" final dans "la mise en place d'un clapet anti-retour sera nécessaire pour : x."
+    # Suppression du texte règlementaire boilerplate
+    for _boilerplate_contains in [
+        "les hauteurs d\u2019eau dans le r\u00e9seau d\u2019assainissement",
+        "L\u2019usager doit se pr\u00e9munir de toutes les cons\u00e9quences de ce fonctionnement du r\u00e9seau, notamment en cas de pr\u00e9sence d\u2019installations sanitaires",
+        "De m\u00eame, tous les orifices sur ces canalisations, situ\u00e9s \u00e0 un niveau inf\u00e9rieur",
+        "Enfin, tout appareil d\u2019\u00e9vacuation se trouvant \u00e0 un niveau inf\u00e9rieur",
+    ]:
+        delete_single_paragraph(doc, _boilerplate_contains)
+    # Recommandation dynamique ou "À remplir"
     if installations_items:
         items_text = _join_french_list(installations_items)
         replace_in_doc(doc, {
             "pour : x.": f"pour : {items_text}."
         })
-    # Si aucun item, laisser le placeholder tel quel (à corriger manuellement)
+    else:
+        replace_in_doc(doc, {
+            "\nAu vu de la configuration du r\u00e9seau d\u2019assainissement de la construction, la mise en place d\u2019un clapet anti-retour sera n\u00e9cessaire pour : x.":
+                "\u00c0 remplir",
+            "Au vu de la configuration du r\u00e9seau d\u2019assainissement de la construction, la mise en place d\u2019un clapet anti-retour sera n\u00e9cessaire pour : x.":
+                "\u00c0 remplir",
+        })
 
     # ── 13. Regards de visite non étanches ──────────────────────────────
-    if regards_noms:
-        noms_text = _join_french_list(regards_noms)
-        replace_in_doc(doc, {
-            "Les regards de visite x n\u2019\u00e9tant":
-                f"Les regards de visite {noms_text} n\u2019\u00e9tant"
-        })
-    if regards_texte:
-        # Replace "il conviendra de les reprendre. X." by the GPT conclusion
-        replace_in_doc(doc, {
-            "il conviendra de les reprendre. X.":
-                f"il conviendra de les reprendre. {regards_texte}"
-        })
+    # Suppression des paragraphes boilerplate règlementaires (dupliqués depuis installations sanitaires)
+    for _boilerplate_contains in [
+        "les hauteurs d\u2019eau dans le r\u00e9seau d\u2019assainissement, en fonctionnement normal",
+        "L\u2019usager doit se pr\u00e9munir de toutes les cons\u00e9quences de ce fonctionnement du r\u00e9seau, notamment en cas de pr\u00e9sence d\u2019installations sanitaires en sous-sol",
+        "De m\u00eame, tous les orifices sur ces canalisations, situ\u00e9s \u00e0 un niveau inf\u00e9rieur \u00e0 celui de la voie vers laquelle se fait l\u2019\u00e9vacuation doivent \u00eatre normalement obtures",
+    ]:
+        delete_single_paragraph(doc, _boilerplate_contains)
+    # Recommandation dynamique ou "À remplir"
+    if regards_noms or regards_texte:
+        if regards_noms:
+            noms_text = _join_french_list(regards_noms)
+            replace_in_doc(doc, {
+                "Les regards de visite x n\u2019\u00e9tant":
+                    f"Les regards de visite {noms_text} n\u2019\u00e9tant"
+            })
+        if regards_texte:
+            replace_in_doc(doc, {
+                "il conviendra de les reprendre. X.":
+                    f"il conviendra de les reprendre. {regards_texte}"
+            })
+        else:
+            replace_in_doc(doc, {"il conviendra de les reprendre. X.": "il conviendra de les reprendre."})
     else:
-        # Juste supprimer le " X." orphelin
-        replace_in_doc(doc, {" X.": "."})
+        replace_in_doc(doc, {
+            "Les regards de visite x n\u2019\u00e9tant pas \u00e9tanche (photos ci-dessous), il conviendra de les reprendre. X.":
+                "\u00c0 remplir",
+        })
 
     # ── 14. Remplacements règlementaires spécifiques ─────────────────────
     # Colonne EP de façade : remplace le texte statique par le commentaire saisi
@@ -881,11 +929,18 @@ def build_rapport(data: dict) -> bytes:
             "pas de colonne ep": commentaire_colonne_ep,
         })
 
-    # Regard de limite de propriété : remplace "regard de visite maçonné" par l'élément choisi
-    if commentaire_regard_limite and commentaire_regard_limite != "regard de visite maçonné":
+    # Regard de limite de propriété : suppression du boilerplate règlementaire
+    delete_single_paragraph(doc, "les canalisations d\u2019\u00e9vacuation des eaux us\u00e9es et pluviales sont dot\u00e9es d\u2019un regard de visite")
+    # Recommandation dynamique ou "À remplir"
+    if commentaire_regard_limite and commentaire_regard_limite != "regard de visite ma\u00e7onn\u00e9":
         replace_in_doc(doc, {
             "la mise en place d\u2019un regard de visite ma\u00e7onn\u00e9 en limite de propri\u00e9t\u00e9":
                 f"la mise en place d\u2019un {commentaire_regard_limite} en limite de propri\u00e9t\u00e9",
+        })
+    else:
+        replace_in_doc(doc, {
+            "Dans le cas pr\u00e9sent, la mise en place d\u2019un regard de visite ma\u00e7onn\u00e9 en limite de propri\u00e9t\u00e9 sera n\u00e9cessaire.":
+                "\u00c0 remplir",
         })
 
     # Ancienne fosse d'aisance : construit la phrase dynamique
@@ -902,36 +957,65 @@ def build_rapport(data: dict) -> bytes:
                 fosse_sentence + " ",
         })
 
-    # Réseau séparatif : remplace P194 entièrement ou juste le "x"
+    # Réseau séparatif : suppression du boilerplate règlementaire
+    for _boilerplate_contains in [
+        "vous avez l\u2019obligation de vous assurer que votre logement",
+        "En syst\u00e8me s\u00e9paratif, les eaux us\u00e9es et pluviales sont r\u00e9cup\u00e9r\u00e9es",
+        "les canalisations et les collecteurs acheminent les eaux us\u00e9es",
+        "les collecteurs pluviaux entra\u00eenent les eaux de pluie",
+        "la tendance est de limiter au maximum la sollicitation de la canalisation",
+        "Citer l\u2019article.",
+    ]:
+        delete_single_paragraph(doc, _boilerplate_contains)
+    # Recommandation dynamique ou "À remplir"
     if commentaire_separatif:
-        # Remplace le paragraphe entier avec le texte généré
         replace_in_doc(doc, {
             "Le r\u00e8glement d\u2019assainissement x impose, avant le raccordement au domaine public, la mise en place d\u2019un syst\u00e8me s\u00e9paratif d\u2019\u00e9vacuation des eaux us\u00e9es et pluviales.":
                 commentaire_separatif,
         })
     else:
-        # Juste remplacer "x" par le règlement applicable
-        reglement_court = reglement.replace("Ville de ", "").replace("ville de ", "")
         replace_in_doc(doc, {
-            "assainissement x impose": f"assainissement de {reglement_court} impose",
+            "Le r\u00e8glement d\u2019assainissement x impose, avant le raccordement au domaine public, la mise en place d\u2019un syst\u00e8me s\u00e9paratif d\u2019\u00e9vacuation des eaux us\u00e9es et pluviales.":
+                "\u00c0 remplir",
         })
 
-    # Restaurants : remplace "x." final par le commentaire
+    # Restaurants : suppression du boilerplate règlementaire
+    for _boilerplate_contains in [
+        "Ces \u00e9tablissements sont susceptibles de rejeter des eaux excessivement charg\u00e9es en graisses",
+        "Ils doivent \u00eatre \u00e9quip\u00e9s d\u2019un syst\u00e8me de pr\u00e9traitement de leurs effluents",
+        "Les \u00e9tablissements (restaurants, cantines",
+    ]:
+        delete_single_paragraph(doc, _boilerplate_contains)
+    # Recommandation dynamique ou "À remplir"
     if commentaire_restaurants:
         replace_in_doc(doc, {
             "il faudra \u00e9quiper le commerce x.":
                 f"il conviendra : {commentaire_restaurants}.",
         })
+    else:
+        replace_in_doc(doc, {
+            "Dans notre cas, il faudra \u00e9quiper le commerce x.":
+                "\u00c0 remplir",
+        })
 
-    # Garages : supprimer l'instruction entre parenthèses dans le titre garages
+    # Garages : suppression du boilerplate règlementaire (P212)
+    delete_single_paragraph(doc, "Afin de ne pas rejeter dans les \u00e9gouts ou dans les caniveaux, des hydrocarbures")
+    # Garages : P213 contient boilerplate + placeholder ; on remplace en 2 passes
+    # Passe 1 : supprimer le boilerplate statique de début de P213
     replace_in_doc(doc, {
-        " \u2018int\u00e9grer ce paragraphe si coch\u00e9 dans selection des paragraphes\u2019": "",
+        "Cette obligation s\u2019applique \u00e9galement aux parcs de stationnement publics et aux parkings d\u2019immeubles, couverts ou non, susceptibles d\u2019accueillir plus d\u00e9couverts ou non, susceptibles.\n\n": "",
+        "Cette obligation s\u2019applique \u00e9galement aux parcs de stationnement publics et aux parkings d\u2019immeubles, couverts ou non, susceptibles d\u2019accueillir plus d\u00e9couverts ou non, susceptibles.\n": "",
     })
-    # Garages : remplacer le placeholder "Dans notre cas, il faudra donc x."
+    # Passe 2 : remplacer le placeholder dynamique
     if commentaire_garages:
         replace_in_doc(doc, {
             "Dans notre cas, il faudra donc x.":
                 f"Dans le cas pr\u00e9sent, il conviendra : {commentaire_garages}.",
+        })
+    else:
+        replace_in_doc(doc, {
+            "\nDans notre cas, il faudra donc x.": "\u00c0 remplir",
+            "Dans notre cas, il faudra donc x.": "\u00c0 remplir",
         })
 
     # ── 15. Conditions de travaux ─────────────────────────────────────────
@@ -996,9 +1080,8 @@ def build_rapport(data: dict) -> bytes:
     _fill_photo_tables(doc, photos_commentees)
 
     # ── 19. Forcer la mise à jour des champs (numéros de page) ───────────
-    # Ajoute <w:updateFields w:val="1"/> dans les settings du document
-    # → Word recalcule PAGE et autres champs à l'ouverture
     _W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    # 19a. w:updateFields dans settings → recalcule tous les champs à l'ouverture
     settings_elem = doc.settings.element
     existing_uf = settings_elem.find(f'{{{_W}}}updateFields')
     if existing_uf is None:
@@ -1006,6 +1089,19 @@ def build_rapport(data: dict) -> bytes:
         uf.set(f'{{{_W}}}val', '1')
     else:
         existing_uf.set(f'{{{_W}}}val', '1')
+    # 19b. w:dirty="1" sur chaque fldChar begin dans les pieds de page
+    # → signale explicitement que la valeur en cache est périmée
+    for section in doc.sections:
+        for hf in [section.footer, section.even_page_footer, section.first_page_footer]:
+            if hf is None:
+                continue
+            for para in hf.paragraphs:
+                for elem in para._element.iter():
+                    tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+                    if tag == 'fldChar':
+                        fc_type = elem.get(f'{{{_W}}}fldCharType')
+                        if fc_type == 'begin':
+                            elem.set(f'{{{_W}}}dirty', '1')
 
     # ── 20. Sérialise en mémoire ─────────────────────────────────────────
     buf = io.BytesIO()
