@@ -11,13 +11,13 @@ import base64
 import threading
 import requests as req_lib
 from docx import Document
-from docx.shared import Pt, Inches, Cm
+from docx.shared import Pt, Inches, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from lxml import etree
 import copy
 
 # Regex pour détecter les en-têtes majeurs de section (I –, II –, ..., VIII –, etc.)
-_MAJOR_SECTION_RE = re.compile(r'^[IVX]+\s+\u2013\s+')
+_MAJOR_SECTION_RE = re.compile(r'^([IVX]+|\d+)\s+\u2013\s+')
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 80 * 1024 * 1024  # 80 MB
@@ -238,9 +238,10 @@ def insert_paragraphs_before(doc: Document, anchor_contains: str, paragraphs_dat
         run = new_para.add_run(text)
         run.bold = bool(pdata.get('bold'))
         run.underline = bool(pdata.get('underline'))
-        # Police Arial 11 systématiquement
+        # Police Arial 11 systématiquement + couleur noir explicite (évite héritage rouge)
         run.font.name = 'Arial'
         run.font.size = Pt(pdata.get('font_size', 11))
+        run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
 
         space_before = pdata.get('space_before', 0)
         space_after  = pdata.get('space_after', 0)
@@ -367,12 +368,16 @@ def _fill_photo_cell(doc: Document, cell, photo_data: dict):
 
     # Commentaire directement dans le paragraphe suivant (sans ligne vide intermédiaire)
     if commentaire:
-        comment_para = cell.add_paragraph(commentaire)
+        comment_para = cell.add_paragraph()
         comment_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        for run in comment_para.runs:
-            run.italic = True
-            run.font.name = 'Arial'
-            run.font.size = Pt(11)
+        run = comment_para.add_run(commentaire)
+        run.bold = True
+        run.italic = True
+        run.font.name = 'Arial'
+        run.font.size = Pt(11)
+        # Désactiver toute transformation de casse (préserver majuscules/minuscules du texte saisi)
+        run.font.all_caps = False
+        run.font.small_caps = False
 
 
 def _clear_cell(cell):
@@ -427,15 +432,185 @@ def _fill_photo_tables(doc: Document, photos_commentees: list):
                 pass
 
         if photo_idx >= total_photos:
-            for remaining_idx in range(tbl_idx + 1, 9):
+            # Supprimer les tables de photos restantes (pour éviter les pages vides)
+            body = doc.element.body
+            for remaining_idx in range(tbl_idx + 1, 10):
                 if remaining_idx < len(doc.tables):
-                    _clear_table(doc.tables[remaining_idx])
+                    tbl_to_del = doc.tables[remaining_idx]
+                    tbl_elem = tbl_to_del._tbl
+                    # Supprimer aussi les paragraphes vides qui précèdent la table
+                    prev_elem = tbl_elem.getprevious()
+                    while prev_elem is not None and prev_elem.tag.endswith('}p') and not _get_para_text(prev_elem).strip():
+                        prev_to_del = prev_elem
+                        prev_elem = prev_elem.getprevious()
+                        try:
+                            body.remove(prev_to_del)
+                        except Exception:
+                            pass
+                    try:
+                        body.remove(tbl_elem)
+                    except Exception:
+                        pass
             break
 
 
 # ─────────────────────────────────────────────
 # Logique principale de remplissage du template
 # ─────────────────────────────────────────────
+
+
+def _add_cadastre_placeholder(doc: Document):
+    """
+    Encadre la section Description du site dans un tableau 2 colonnes.
+    Colonne gauche : texte de description. Colonne droite : encadré jaune cadastre.
+    """
+    from docx.oxml.ns import qn
+    W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    body = doc.element.body
+
+    # Trouver les limites : premier paragraphe après "II – DESCRIPTION DU SITE"
+    # et jusqu'au paragraphe "III – GÉOLOGIE IN SITU" (non inclus)
+    desc_start_elem = None
+    desc_end_before_elem = None
+    found_heading = False
+
+    for elem in list(body):
+        if not elem.tag.endswith('}p'):
+            if found_heading and desc_start_elem is not None:
+                # table inside description section, skip
+                continue
+            continue
+        text = _get_para_text(elem)
+        if 'DESCRIPTION DU SITE' in text.upper() and not found_heading:
+            found_heading = True
+            continue
+        if found_heading:
+            if desc_start_elem is None:
+                desc_start_elem = elem
+            if ('G\u00c9OLOGIE' in text.upper() or 'III' in text or
+                    'CANALISATIONS' in text.upper() or
+                    _MAJOR_SECTION_RE.match(text)):
+                desc_end_before_elem = elem
+                break
+
+    if desc_start_elem is None:
+        return
+
+    # Collecter tous les paragraphes de description
+    collecting = False
+    desc_elems = []
+    for elem in list(body):
+        if elem is desc_start_elem:
+            collecting = True
+        if collecting:
+            if desc_end_before_elem is not None and elem is desc_end_before_elem:
+                break
+            desc_elems.append(elem)
+
+    if not desc_elems:
+        return
+
+    # Créer un tableau 2 colonnes, 1 ligne, sans bordures visibles
+    tbl = doc.add_table(rows=1, cols=2)
+    tbl_elem = tbl._tbl
+
+    # Supprimer le style de table par défaut (pour éviter les bordures)
+    tbl_pr = tbl_elem.find(f'{{{W_NS}}}tblPr')
+    if tbl_pr is None:
+        tbl_pr = etree.SubElement(tbl_elem, f'{{{W_NS}}}tblPr')
+    # Forcer la largeur totale
+    tbl_w = tbl_pr.find(f'{{{W_NS}}}tblW')
+    if tbl_w is None:
+        tbl_w = etree.SubElement(tbl_pr, f'{{{W_NS}}}tblW')
+    tbl_w.set(f'{{{W_NS}}}w', '9356')  # largeur en twips (~16.5cm page A4 avec marges)
+    tbl_w.set(f'{{{W_NS}}}type', 'dxa')
+    # Supprimer les bordures de table
+    tbl_borders = tbl_pr.find(f'{{{W_NS}}}tblBorders')
+    if tbl_borders is None:
+        tbl_borders = etree.SubElement(tbl_pr, f'{{{W_NS}}}tblBorders')
+    for side in ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']:
+        border_el = tbl_borders.find(f'{{{W_NS}}}{side}')
+        if border_el is None:
+            border_el = etree.SubElement(tbl_borders, f'{{{W_NS}}}{side}')
+        border_el.set(f'{{{W_NS}}}val', 'none')
+        border_el.set(f'{{{W_NS}}}sz', '0')
+        border_el.set(f'{{{W_NS}}}space', '0')
+        border_el.set(f'{{{W_NS}}}color', 'auto')
+
+    # Largeur des colonnes (grille)
+    tbl_grid = tbl_elem.find(f'{{{W_NS}}}tblGrid')
+    if tbl_grid is None:
+        tbl_grid = etree.SubElement(tbl_elem, f'{{{W_NS}}}tblGrid')
+    for col_elem in list(tbl_grid):
+        tbl_grid.remove(col_elem)
+    col_left_w = etree.SubElement(tbl_grid, f'{{{W_NS}}}gridCol')
+    col_left_w.set(f'{{{W_NS}}}w', '6237')   # ~11 cm
+    col_right_w = etree.SubElement(tbl_grid, f'{{{W_NS}}}gridCol')
+    col_right_w.set(f'{{{W_NS}}}w', '3119')  # ~5.5 cm
+
+    row = tbl.rows[0]
+    left_cell = row.cells[0]
+    right_cell = row.cells[1]
+
+    # Définir les largeurs de cellules
+    for cell, w in [(left_cell, '6237'), (right_cell, '3119')]:
+        tc = cell._tc
+        tc_pr = tc.find(f'{{{W_NS}}}tcPr')
+        if tc_pr is None:
+            tc_pr = etree.SubElement(tc, f'{{{W_NS}}}tcPr')
+        tc_w = tc_pr.find(f'{{{W_NS}}}tcW')
+        if tc_w is None:
+            tc_w = etree.SubElement(tc_pr, f'{{{W_NS}}}tcW')
+        tc_w.set(f'{{{W_NS}}}w', w)
+        tc_w.set(f'{{{W_NS}}}type', 'dxa')
+
+    # Déplacer les paragraphes de description dans la cellule gauche
+    left_tc = left_cell._tc
+    # Supprimer le paragraphe vide initial de la cellule gauche
+    for p in list(left_tc.findall(f'{{{W_NS}}}p')):
+        left_tc.remove(p)
+    for elem in desc_elems:
+        try:
+            body.remove(elem)
+        except Exception:
+            pass
+        left_tc.append(elem)
+
+    # Cellule droite : fond jaune + texte placeholder cadastre
+    right_tc = right_cell._tc
+    tc_pr_r = right_tc.find(f'{{{W_NS}}}tcPr')
+    if tc_pr_r is None:
+        tc_pr_r = etree.SubElement(right_tc, f'{{{W_NS}}}tcPr')
+    # Fond jaune
+    shd = etree.SubElement(tc_pr_r, f'{{{W_NS}}}shd')
+    shd.set(f'{{{W_NS}}}val', 'clear')
+    shd.set(f'{{{W_NS}}}color', 'auto')
+    shd.set(f'{{{W_NS}}}fill', 'FFF100')
+    # Alignement vertical centré
+    v_align = etree.SubElement(tc_pr_r, f'{{{W_NS}}}vAlign')
+    v_align.set(f'{{{W_NS}}}val', 'center')
+
+    # Texte placeholder
+    right_para = right_cell.paragraphs[0] if right_cell.paragraphs else right_cell.add_paragraph()
+    right_para.clear()
+    right_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run_r = right_para.add_run("IMPRIM ÉCRAN DU\nCADAST RE\nÀ RÉALISER AU BUREAU")
+    # Better: two runs with proper line breaks
+    right_para.clear()
+    lines = ["IMPRIM ÉCRAN DU CADASTRE", "À RÉALISER AU BUREAU"]
+    for idx_l, line in enumerate(lines):
+        run_r = right_para.add_run(line)
+        run_r.bold = True
+        run_r.font.name = 'Arial'
+        run_r.font.size = Pt(10)
+        run_r.font.color.rgb = RGBColor(0x00, 0x1F, 0x5B)
+        if idx_l < len(lines) - 1:
+            run_r.add_break()
+
+    # Insérer le tableau à l'emplacement du premier paragraphe de description
+    desc_start_elem.addprevious(tbl_elem)
+
 
 def build_rapport(data: dict) -> bytes:
     doc = Document(TEMPLATE_PATH)
@@ -660,6 +835,9 @@ def build_rapport(data: dict) -> bytes:
         "\nLe plan du sous-sol": "Le plan du sous-sol",
     })
 
+    # ── 4c. Encadrer la description du site avec un placeholder cadastre ──
+    _add_cadastre_placeholder(doc)
+
     # ── 6. Section IV – Paris vs Hors-Paris ──────────────────────────────
     PARIS_MARKER      = "\u2018si rapport dans paris mettre ce paragraphe\u00a0:\u2019"
     HORS_PARIS_MARKER = "\u2018si rapport en dehors de paris"
@@ -667,7 +845,6 @@ def build_rapport(data: dict) -> bytes:
 
     if is_paris:
         # Supprimer le marqueur Paris ET le paragraphe vide qui suit
-        # (sinon un espace visuel indésirable apparaît sous l'en-tête IV)
         delete_elements_by_text_range(doc,
             start_contains=PARIS_MARKER,
             end_contains="Le rapport d\u2019inspection t\u00e9l\u00e9vis\u00e9e",
@@ -686,6 +863,20 @@ def build_rapport(data: dict) -> bytes:
             start_contains=HORS_PARIS_MARKER,
             end_contains="Le rapport d\u2019inspection t\u00e9l\u00e9vis\u00e9e",
             include_start=True, include_end=False)
+    # Supprimer le paragraphe vide en bas de section IV (entre dernière ligne légende et section suivante)
+    # Ce paragraphe (P96 dans le template) devient un saut de ligne visuel indésirable après la légende
+    body_ch = list(doc.element.body)
+    for i, elem in enumerate(body_ch):
+        if elem.tag.endswith("}p") and "garantissant plus une bonne" in _get_para_text(elem):
+            # Supprimer le paragraphe vide suivant s'il existe
+            if i + 1 < len(body_ch):
+                next_e = body_ch[i + 1]
+                if next_e.tag.endswith("}p") and not _get_para_text(next_e).strip():
+                    try:
+                        doc.element.body.remove(next_e)
+                    except Exception:
+                        pass
+            break
 
     # ── 7. Section V – BPE ───────────────────────────────────────────────
     BPE_MARKER    = "\u2018si dans la page de l\u2019application Branchement"
