@@ -405,21 +405,33 @@ def _clear_table(tbl):
 
 def _fill_photo_tables(doc: Document, photos_commentees: list):
     """
-    Remplit les tables de photos (à partir de la table index 5) avec les photos fournies.
-    Vide les cellules sans photo et supprime les lignes entièrement vides.
+    Remplit les tables de photos du complément photographique.
+    Identifie les tables photo dynamiquement par leur contenu (placeholder 'ici photo')
+    pour éviter les problèmes de décalage d'indice causés par les tables insérées
+    dynamiquement (ex: cadastre placeholder).
     """
     photo_idx = 0
     total_photos = len(photos_commentees)
+    body = doc.element.body
 
-    # La table 5 est la première table du complément photographique (section VI)
-    # (tables 0-4 sont les tables de la page de garde et du corps du document)
-    for tbl_idx in range(5, 10):
-        if tbl_idx >= len(doc.tables):
-            break
-        tbl = doc.tables[tbl_idx]
+    # ── Trouver dynamiquement les tables photo par leur contenu ──────────────
+    # Le template a des cellules contenant 'ici photo' dans les tables photo
+    photo_tables = []
+    for tbl in doc.tables:
+        try:
+            cell_text = tbl.cell(0, 0).text.lower()
+        except Exception:
+            cell_text = ''
+        if 'ici photo' in cell_text:
+            photo_tables.append(tbl)
+
+    if not photo_tables:
+        return  # Aucune table photo trouvée
+
+    for tbl_pos, tbl in enumerate(photo_tables):
         rows_to_remove = []
 
-        for row_idx, row in enumerate(tbl.rows):
+        for row in tbl.rows:
             row_has_photo = False
             n_cols = min(2, len(row.cells))
             for col_idx in range(n_cols):
@@ -444,25 +456,24 @@ def _fill_photo_tables(doc: Document, photos_commentees: list):
                 pass
 
         if photo_idx >= total_photos:
-            # Supprimer les tables de photos restantes (pour éviter les pages vides)
-            body = doc.element.body
-            for remaining_idx in range(tbl_idx + 1, 11):
-                if remaining_idx < len(doc.tables):
-                    tbl_to_del = doc.tables[remaining_idx]
-                    tbl_elem = tbl_to_del._tbl
-                    # Supprimer aussi les paragraphes vides qui précèdent la table
-                    prev_elem = tbl_elem.getprevious()
-                    while prev_elem is not None and prev_elem.tag.endswith('}p') and not _get_para_text(prev_elem).strip():
-                        prev_to_del = prev_elem
-                        prev_elem = prev_elem.getprevious()
-                        try:
-                            body.remove(prev_to_del)
-                        except Exception:
-                            pass
+            # Supprimer les tables photo restantes et leurs paragraphes précédents
+            for remaining_tbl in photo_tables[tbl_pos + 1:]:
+                remaining_elem = remaining_tbl._tbl
+                # Supprimer les paragraphes vides/sauts de page qui précèdent
+                prev_elem = remaining_elem.getprevious()
+                while (prev_elem is not None
+                       and prev_elem.tag.endswith('}p')
+                       and not _get_para_text(prev_elem).strip()):
+                    prev_to_del = prev_elem
+                    prev_elem = prev_elem.getprevious()
                     try:
-                        body.remove(tbl_elem)
+                        body.remove(prev_to_del)
                     except Exception:
                         pass
+                try:
+                    body.remove(remaining_elem)
+                except Exception:
+                    pass
             break
 
 
