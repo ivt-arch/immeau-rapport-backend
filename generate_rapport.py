@@ -998,7 +998,7 @@ def build_rapport(data: dict) -> bytes:
             zone_paragraphs.append({
                 'text': f"Canalisations apparentes en caves {zone_name}",
                 'bold': True, 'underline': True, 'bullet': True,
-                'space_before': 12,
+                'space_before': 12, 'space_after': 4,
             })
             zone_paragraphs.append({
                 'text': app_phrase, 'bold': False, 'space_after': 6,
@@ -1008,7 +1008,7 @@ def build_rapport(data: dict) -> bytes:
             zone_paragraphs.append({
                 'text': f"Canalisations enterr\u00e9es sous {zone_name}",
                 'bold': True, 'underline': True, 'bullet': True,
-                'space_before': 12,
+                'space_before': 12, 'space_after': 4,
             })
             zone_paragraphs.append({
                 'text': ent_phrase, 'bold': False, 'space_after': 6,
@@ -1022,7 +1022,7 @@ def build_rapport(data: dict) -> bytes:
             zone_paragraphs.append({
                 'text': f"Canalisations enterr\u00e9es sous espaces ext\u00e9rieurs ({zone_name})",
                 'bold': True, 'underline': True, 'bullet': True,
-                'space_before': 12,
+                'space_before': 12, 'space_after': 4,
             })
             zone_paragraphs.append({
                 'text': ent_phrase, 'bold': False, 'space_after': 6,
