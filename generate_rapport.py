@@ -405,14 +405,15 @@ def _clear_table(tbl):
 
 def _fill_photo_tables(doc: Document, photos_commentees: list):
     """
-    Remplit les tables de photos (à partir de la table index 4) avec les photos fournies.
+    Remplit les tables de photos (à partir de la table index 5) avec les photos fournies.
     Vide les cellules sans photo et supprime les lignes entièrement vides.
     """
     photo_idx = 0
     total_photos = len(photos_commentees)
 
-    # La table 4 est la table du complément photographique (section VI)
-    for tbl_idx in range(4, 9):
+    # La table 5 est la première table du complément photographique (section VI)
+    # (tables 0-4 sont les tables de la page de garde et du corps du document)
+    for tbl_idx in range(5, 10):
         if tbl_idx >= len(doc.tables):
             break
         tbl = doc.tables[tbl_idx]
@@ -445,7 +446,7 @@ def _fill_photo_tables(doc: Document, photos_commentees: list):
         if photo_idx >= total_photos:
             # Supprimer les tables de photos restantes (pour éviter les pages vides)
             body = doc.element.body
-            for remaining_idx in range(tbl_idx + 1, 10):
+            for remaining_idx in range(tbl_idx + 1, 11):
                 if remaining_idx < len(doc.tables):
                     tbl_to_del = doc.tables[remaining_idx]
                     tbl_elem = tbl_to_del._tbl
