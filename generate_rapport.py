@@ -1480,30 +1480,60 @@ def build_rapport(data: dict) -> bytes:
         uf.set(f'{{{_W}}}val', '1')
     else:
         existing_uf.set(f'{{{_W}}}val', '1')
-    # 19b. w:dirty="1" sur chaque fldChar begin dans les pieds de page
-    # → signale explicitement que la valeur en cache est périmée.
-    # On efface aussi la valeur cachée (<w:t> entre "separate" et "end")
-    # pour éviter que des visionneuses PDF/e-mail affichent un numéro figé.
+    # 19b. Cibler uniquement le champ PAGE dans les pieds de page :
+    # - dirty="1" sur son fldChar begin → recalcul à l'ouverture
+    # - Suppression complète du/des run(s) de valeur cachée (entre separate et end)
+    #   pour éviter que certains rendeurs mobiles affichent l'ancien "2" + le
+    #   numéro recalculé côte-à-côte (ex : "Page 22" au lieu de "Page 2").
+    # NB : on ne touche pas aux autres champs du footer (FILENAME, DATE, etc.).
     for section in doc.sections:
         for hf in [section.footer, section.even_page_footer, section.first_page_footer]:
             if hf is None:
                 continue
             for para in hf.paragraphs:
-                after_separate = False
-                for elem in para._element.iter():
-                    tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
-                    if tag == 'fldChar':
-                        fc_type = elem.get(f'{{{_W}}}fldCharType')
+                _p = para._element
+                # Machine à états sur les <w:r> enfants directs du paragraphe
+                state = 'outside'   # outside | in_begin | in_instr | after_sep
+                begin_fc = None
+                is_page_field = False
+                cached_runs = []
+                for child in list(_p):
+                    ctag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                    if ctag != 'r':
+                        continue
+                    fcs = child.findall(f'{{{_W}}}fldChar')
+                    instrs = child.findall(f'{{{_W}}}instrText')
+                    if fcs:
+                        fc_type = fcs[0].get(f'{{{_W}}}fldCharType')
                         if fc_type == 'begin':
-                            elem.set(f'{{{_W}}}dirty', '1')
-                            after_separate = False
+                            state = 'in_begin'
+                            begin_fc = fcs[0]
+                            is_page_field = False
+                            cached_runs = []
                         elif fc_type == 'separate':
-                            after_separate = True
+                            state = 'after_sep' if is_page_field else 'outside'
                         elif fc_type == 'end':
-                            after_separate = False
-                    elif tag == 't' and after_separate:
-                        # Effacer la valeur en cache (ex: "2") pour forcer le recalcul
-                        elem.text = ''
+                            if is_page_field and state == 'after_sep':
+                                # Supprimer les runs de valeur cachée
+                                for cr in cached_runs:
+                                    try:
+                                        cr.getparent().remove(cr)
+                                    except Exception:
+                                        pass
+                            state = 'outside'
+                            begin_fc = None
+                            is_page_field = False
+                            cached_runs = []
+                    elif instrs:
+                        if state == 'in_begin' and 'PAGE' in (instrs[0].text or ''):
+                            is_page_field = True
+                            state = 'in_instr'
+                            if begin_fc is not None:
+                                begin_fc.set(f'{{{_W}}}dirty', '1')
+                        elif state in ('in_begin', 'in_instr'):
+                            state = 'in_instr'
+                    elif state == 'after_sep' and is_page_field:
+                        cached_runs.append(child)
 
     # ── 20. Sérialise en mémoire ─────────────────────────────────────────
     buf = io.BytesIO()
