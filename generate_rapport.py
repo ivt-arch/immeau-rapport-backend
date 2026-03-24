@@ -177,8 +177,14 @@ def _convert_numpr_to_manual_bullet(para, font_size=11):
 def _remove_elements(body, elements):
     for elem in elements:
         try:
-            body.remove(elem)
-        except ValueError:
+            # Utiliser getparent() pour être sûr de supprimer depuis le vrai parent
+            # (body.remove() échoue silencieusement si l'élément a été déplacé)
+            parent = elem.getparent()
+            if parent is not None:
+                parent.remove(elem)
+            else:
+                body.remove(elem)
+        except Exception:
             pass
 
 
@@ -840,6 +846,84 @@ def build_rapport(data: dict) -> bytes:
     ]
     for old_r, new_r in ROMAN_TO_ARABIC:
         replace_in_doc(doc, {old_r: new_r})
+
+    # ── 0b-bis. Nettoyer les lignes vides en excès dans le SOMMAIRE ──────
+    # Le template a trop de paragraphes TM1 vides après les entrées du sommaire
+    # (ex : 19 lignes). Avec spacing-before=180 par para, ils débordent sur la
+    # page suivante et créent une page blanche. On les supprime tous SAUF 2
+    # pour garder un léger espace visuel.
+    # On ajoute aussi un saut de page explicite avant le PRÉAMBULE du corps
+    # pour garantir une séparation propre entre la page SOMMAIRE et la suite.
+    _W_S = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    _body_s = doc.element.body
+    in_sommaire_zone = False
+    preambule_toc_seen = False
+    empty_toc_kept = 0
+    to_del_toc = []
+    preambule_body_elem = None
+
+    for elem in list(_body_s):
+        if not elem.tag.endswith('}p'):
+            if in_sommaire_zone:
+                break  # Une table = fin de zone sommaire
+            continue
+        text = _get_para_text(elem).strip()
+        pPr = elem.find(f'{{{_W_S}}}pPr')
+        style_val = ''
+        if pPr is not None:
+            ps = pPr.find(f'{{{_W_S}}}pStyle')
+            if ps is not None:
+                style_val = ps.get(f'{{{_W_S}}}val', '')
+
+        if text == 'SOMMAIRE':
+            in_sommaire_zone = True
+            continue
+        if not in_sommaire_zone:
+            continue
+
+        if style_val == 'TM1':
+            if not text:  # Ligne TM1 vide
+                empty_toc_kept += 1
+                if empty_toc_kept > 2:
+                    to_del_toc.append(elem)
+            else:
+                if text == 'PR\u00c9AMBULE':
+                    preambule_toc_seen = True
+        elif text == 'PR\u00c9AMBULE' and preambule_toc_seen:
+            # Deuxième "PRÉAMBULE" = celui du corps du document
+            preambule_body_elem = elem
+            break
+        elif not text:
+            to_del_toc.append(elem)
+        else:
+            # Premier paragraphe non-vide non-TM1 non-PRÉAMBULE = corps
+            preambule_body_elem = elem
+            break
+
+    # Supprimer les lignes vides en excès
+    for elem in to_del_toc:
+        try:
+            elem.getparent().remove(elem)
+        except Exception:
+            pass
+
+    # Ajouter un saut de page avant le PRÉAMBULE du corps (s'il n'en a pas déjà un)
+    if preambule_body_elem is not None:
+        prev = preambule_body_elem.getprevious()
+        prev_has_pb = False
+        if prev is not None and prev.tag.endswith('}p'):
+            for br in prev.iter(f'{{{_W_S}}}br'):
+                if br.get(f'{{{_W_S}}}type', '') == 'page':
+                    prev_has_pb = True
+                    break
+        if not prev_has_pb:
+            pb_para = doc.add_paragraph()
+            run = pb_para.add_run()
+            br_elem = etree.SubElement(run._r, f'{{{_W_S}}}br')
+            br_elem.set(f'{{{_W_S}}}type', 'page')
+            pb_elem = pb_para._element
+            _body_s.remove(pb_elem)
+            preambule_body_elem.addprevious(pb_elem)
 
     # ── 0b. Supprimer P70/P71 AVANT les remplacements globaux ────────────
     # Ces paragraphes contiennent les placeholders 'adresse et 'numéro qui
