@@ -255,11 +255,15 @@ def delete_section_by_title(doc: Document, section_title: str):
     _remove_elements(body, to_remove)
 
 
-def insert_paragraphs_before(doc: Document, anchor_contains: str, paragraphs_data: list):
+def insert_paragraphs_before(doc: Document, anchor_contains: str, paragraphs_data: list,
+                             ref_list_para=None):
     """
     Insère des paragraphes avant l'élément contenant anchor_contains.
     paragraphs_data : liste de dicts { 'text', 'bold', 'underline', 'bullet', 'font_size' }
+    ref_list_para   : paragraphe de référence dont on copie le style liste Word (numPr + ind)
+                      pour les entrées avec 'bullet': True. Si None, utilise une puce manuelle •.
     """
+    _W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
     body = doc.element.body
     anchor = None
     for elem in body:
@@ -268,6 +272,19 @@ def insert_paragraphs_before(doc: Document, anchor_contains: str, paragraphs_dat
             break
     if anchor is None:
         return
+
+    # Extraire numPr et ind du paragraphe de référence (une seule fois)
+    ref_numPr = None
+    ref_ind   = None
+    if ref_list_para is not None:
+        ref_pPr = ref_list_para._element.find(f'{{{_W}}}pPr')
+        if ref_pPr is not None:
+            _np = ref_pPr.find(f'{{{_W}}}numPr')
+            if _np is not None:
+                ref_numPr = copy.deepcopy(_np)
+            _ind = ref_pPr.find(f'{{{_W}}}ind')
+            if _ind is not None:
+                ref_ind = copy.deepcopy(_ind)
 
     last_inserted = None
     for pdata in paragraphs_data:
@@ -278,13 +295,30 @@ def insert_paragraphs_before(doc: Document, anchor_contains: str, paragraphs_dat
         is_underline = bool(pdata.get('underline'))
 
         if pdata.get('bullet'):
-            # Puce dans un run séparé SANS soulignement pour ne pas sous-ligner le •
-            bullet_run = new_para.add_run("\u2022  ")
-            bullet_run.bold = is_bold
-            bullet_run.underline = False
-            bullet_run.font.name = 'Arial'
-            bullet_run.font.size = Pt(font_size)
-            bullet_run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+            if ref_numPr is not None:
+                # Copier le style liste Word du paragraphe de référence
+                pPr = new_para._element.find(f'{{{_W}}}pPr')
+                if pPr is None:
+                    pPr = etree.SubElement(new_para._element, f'{{{_W}}}pPr')
+                    new_para._element.insert(0, pPr)
+                # Ajouter numPr (et ind si présent) dans pPr
+                existing_np = pPr.find(f'{{{_W}}}numPr')
+                if existing_np is not None:
+                    pPr.remove(existing_np)
+                pPr.append(copy.deepcopy(ref_numPr))
+                if ref_ind is not None:
+                    existing_ind = pPr.find(f'{{{_W}}}ind')
+                    if existing_ind is not None:
+                        pPr.remove(existing_ind)
+                    pPr.append(copy.deepcopy(ref_ind))
+            else:
+                # Fallback : puce manuelle • dans un run séparé sans soulignement
+                bullet_run = new_para.add_run("\u2022  ")
+                bullet_run.bold = is_bold
+                bullet_run.underline = False
+                bullet_run.font.name = 'Arial'
+                bullet_run.font.size = Pt(font_size)
+                bullet_run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
 
         run = new_para.add_run(text)
         run.bold = is_bold
@@ -1096,7 +1130,16 @@ def build_rapport(data: dict) -> bytes:
             if anchor:
                 break
         if anchor:
-            insert_paragraphs_before(doc, anchor, zone_paragraphs)
+            # Trouver un paragraphe de référence avec le style liste Word du template
+            # (numPr + underline) pour que les titres de canalisations aient le même
+            # style que "Regard de limite de propriété", "Colonne d'eaux pluviales", etc.
+            ref_list_para = None
+            for para in doc.paragraphs:
+                if _has_numpr(para._element) and _has_underline(para._element):
+                    ref_list_para = para
+                    break
+            insert_paragraphs_before(doc, anchor, zone_paragraphs,
+                                     ref_list_para=ref_list_para)
 
     # ── 9. Sections de conclusions – supprimer les non sélectionnées ─────
     SECTION_MAP = {
@@ -1126,14 +1169,6 @@ def build_rapport(data: dict) -> bytes:
                 if instr_marker in para.text:
                     replace_text_in_paragraph(para, instr_marker, "")
                     break
-
-    # ── 10b. Uniformiser les puces : convertir les titres de sections ─────
-    # Les titres du template (ex: "Regard de limite de propriété") utilisent
-    # le style liste Word (w:numPr), tandis que les titres de canalisations
-    # sont insérés avec une puce manuelle •. On aligne tout sur la puce manuelle.
-    for para in doc.paragraphs:
-        if _has_numpr(para._element) and _has_underline(para._element):
-            _convert_numpr_to_manual_bullet(para)
 
     # ── 11. Règlement d'assainissement ───────────────────────────────────
     if reglement and "Paris" not in reglement:
