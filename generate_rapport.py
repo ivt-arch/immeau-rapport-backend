@@ -81,10 +81,16 @@ def replace_text_in_paragraph_safe(paragraph, old: str, new: str) -> bool:
     un fldChar 'separate' et un fldChar 'end') sont AUSSI exclus — sinon leur texte
     (ex: '2' pour le champ PAGE) serait fusionné dans le premier run et s'afficherait
     en double à côté du champ recalculé.
+
+    Note technique : on garde des références dures (liste d'objets) plutôt que des
+    id() entiers, car les proxies lxml peuvent être ramassés par le GC entre les deux
+    boucles, provoquant des collisions d'adresse mémoire et des faux-positifs.
     """
     _Wns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-    # Repérer les runs de valeur en cache (entre separate et end)
-    cached_run_ids: set = set()
+    # Repérer les runs de valeur en cache (entre separate et end).
+    # On conserve les références directes (hard refs) pour éviter que le GC lxml
+    # les recycle et crée de faux id() identiques sur d'autres éléments.
+    cached_run_elems: list = []
     _after_sep = False
     for child in paragraph._element:
         ctag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
@@ -99,13 +105,13 @@ def replace_text_in_paragraph_safe(paragraph, old: str, new: str) -> bool:
                 elif _fc_type == 'end':
                     _after_sep = False
             elif _after_sep:
-                cached_run_ids.add(id(child))
+                cached_run_elems.append(child)  # référence dure → pas de GC
 
     # Identifier les runs "purs" : pas de fldChar/instrText ET pas en cache de champ
     safe_runs = [
         run for run in paragraph.runs
         if not any(child.tag in _FIELD_TAGS for child in run._r)
-        and id(run._r) not in cached_run_ids
+        and not any(run._r is cr for cr in cached_run_elems)  # comparaison par identité
     ]
     full = "".join(run.text for run in safe_runs)
     if old not in full:
