@@ -75,11 +75,37 @@ _FIELD_TAGS = frozenset([
 
 def replace_text_in_paragraph_safe(paragraph, old: str, new: str) -> bool:
     """Remplace old par new dans un paragraphe en ne touchant que les runs
-    sans éléments de champ (fldChar, instrText). Préserve les champs PAGE/DATE."""
-    # Identifier les runs "purs" (pas de fldChar ni instrText)
+    sans éléments de champ (fldChar, instrText). Préserve les champs PAGE/DATE.
+
+    Important : les runs qui sont des valeurs en cache de champ (positionnés entre
+    un fldChar 'separate' et un fldChar 'end') sont AUSSI exclus — sinon leur texte
+    (ex: '2' pour le champ PAGE) serait fusionné dans le premier run et s'afficherait
+    en double à côté du champ recalculé.
+    """
+    _Wns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    # Repérer les runs de valeur en cache (entre separate et end)
+    cached_run_ids: set = set()
+    _after_sep = False
+    for child in paragraph._element:
+        ctag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+        if ctag == 'r':
+            _fcs = child.findall(f'{{{_Wns}}}fldChar')
+            if _fcs:
+                _fc_type = _fcs[0].get(f'{{{_Wns}}}fldCharType')
+                if _fc_type == 'begin':
+                    _after_sep = False
+                elif _fc_type == 'separate':
+                    _after_sep = True
+                elif _fc_type == 'end':
+                    _after_sep = False
+            elif _after_sep:
+                cached_run_ids.add(id(child))
+
+    # Identifier les runs "purs" : pas de fldChar/instrText ET pas en cache de champ
     safe_runs = [
         run for run in paragraph.runs
         if not any(child.tag in _FIELD_TAGS for child in run._r)
+        and id(run._r) not in cached_run_ids
     ]
     full = "".join(run.text for run in safe_runs)
     if old not in full:
