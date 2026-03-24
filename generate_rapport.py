@@ -873,18 +873,17 @@ def build_rapport(data: dict) -> bytes:
     for old_r, new_r in ROMAN_TO_ARABIC:
         replace_in_doc(doc, {old_r: new_r})
 
-    # ── 0b-bis. Nettoyer les lignes vides en excès dans le SOMMAIRE ──────
-    # Le template a trop de paragraphes TM1 vides après les entrées du sommaire
-    # (ex : 19 lignes). Avec spacing-before=180 par para, ils débordent sur la
-    # page suivante et créent une page blanche. On les supprime tous SAUF 2
-    # pour garder un léger espace visuel.
+    # ── 0b-bis. Nettoyer toutes les lignes vides du SOMMAIRE ────────────
+    # Le template contient de nombreux paragraphes TM1 vides après les entrées
+    # du sommaire (ex : 19 lignes). Avec spacing-before=180 par para, même 2
+    # d'entre eux peuvent déborder sur la page suivante selon la longueur du
+    # sommaire (rapports avec beaucoup de sections). On les supprime TOUS.
     # On ajoute aussi un saut de page explicite avant le PRÉAMBULE du corps
     # pour garantir une séparation propre entre la page SOMMAIRE et la suite.
     _W_S = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
     _body_s = doc.element.body
     in_sommaire_zone = False
     preambule_toc_seen = False
-    empty_toc_kept = 0
     to_del_toc = []
     preambule_body_elem = None
 
@@ -908,10 +907,8 @@ def build_rapport(data: dict) -> bytes:
             continue
 
         if style_val == 'TM1':
-            if not text:  # Ligne TM1 vide
-                empty_toc_kept += 1
-                if empty_toc_kept > 2:
-                    to_del_toc.append(elem)
+            if not text:  # Ligne TM1 vide → supprimer systématiquement
+                to_del_toc.append(elem)
             else:
                 if text == 'PR\u00c9AMBULE':
                     preambule_toc_seen = True
