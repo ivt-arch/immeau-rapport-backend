@@ -1624,8 +1624,18 @@ def _ia_set_cell_bg(cell, hex6: str):
     shd.set(f'{{{_IA_W_NS}}}fill', hex6.upper())
 
 
+def _ia_get_or_add_tblPr(tbl_elem):
+    """Retourne w:tblPr existant ou en crée un en tête de table (compatible python-docx 1.x)."""
+    W = _IA_W_NS
+    tblPr = tbl_elem.find(f'{{{W}}}tblPr')
+    if tblPr is None:
+        tblPr = etree.Element(f'{{{W}}}tblPr')
+        tbl_elem.insert(0, tblPr)
+    return tblPr
+
+
 def _ia_set_table_no_border(tbl):
-    tblPr = tbl._tbl.get_or_add_tblPr()
+    tblPr = _ia_get_or_add_tblPr(tbl._tbl)
     for old in tblPr.findall(f'{{{_IA_W_NS}}}tblBorders'):
         tblPr.remove(old)
     tblBorders = etree.SubElement(tblPr, f'{{{_IA_W_NS}}}tblBorders')
@@ -1635,7 +1645,7 @@ def _ia_set_table_no_border(tbl):
 
 
 def _ia_set_table_full_width(tbl):
-    tblPr = tbl._tbl.get_or_add_tblPr()
+    tblPr = _ia_get_or_add_tblPr(tbl._tbl)
     tblW = tblPr.find(f'{{{_IA_W_NS}}}tblW')
     if tblW is None:
         tblW = etree.SubElement(tblPr, f'{{{_IA_W_NS}}}tblW')
