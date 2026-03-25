@@ -1596,125 +1596,482 @@ def _call_claude_api(system_prompt: str, user_prompt: str, max_tokens: int = 400
     raise Exception(f"Claude API erreur {resp.status_code}: {resp.text[:300]}")
 
 
-def _add_heading_ia(doc, text: str, level: int = 1):
-    """Ajoute un titre de section (niveau 1 ou 2) en Arial gras."""
-    p = doc.add_paragraph()
-    run = p.add_run(text)
-    run.bold = True
-    run.font.name = "Arial"
-    run.font.size = Pt(13 if level == 1 else 11)
-    p.paragraph_format.space_before = Pt(14)
-    p.paragraph_format.space_after  = Pt(6)
-    return p
+# ═══════════════════════════════════════════════════════════════
+# RAPPORT IA — Palette Imméau & helpers XML
+# ═══════════════════════════════════════════════════════════════
+
+_IA_NAVY  = '1F4E79'   # Bleu marine principal
+_IA_BLUE  = '2E75B6'   # Bleu accent
+_IA_LCYAN = 'DEEAF1'   # Bleu très clair (fond bandeau adresse)
+_IA_LGRAY = 'F5F5F5'   # Gris clair (fond objet)
+_IA_WHITE = 'FFFFFF'
+_IA_W_NS  = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 
 
-def _add_body_ia(doc, text: str, bold: bool = False):
-    """Ajoute un paragraphe de corps de texte en Arial 11."""
-    if not text.strip():
-        return
-    p = doc.add_paragraph()
-    run = p.add_run(text.strip())
-    run.font.name = "Arial"
-    run.font.size = Pt(11)
-    run.bold = bold
-    p.paragraph_format.space_after = Pt(6)
-    return p
+def _ia_rgb(hex6: str) -> RGBColor:
+    h = hex6.lstrip('#')
+    return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
 
 
-def _add_bullet_ia(doc, text: str):
-    """Ajoute une puce (•) en Arial 11."""
-    p = doc.add_paragraph()
-    run = p.add_run(f"\u2022  {text.strip()}")
-    run.font.name = "Arial"
-    run.font.size = Pt(11)
-    p.paragraph_format.left_indent = Cm(0.5)
-    p.paragraph_format.space_after = Pt(4)
+def _ia_set_cell_bg(cell, hex6: str):
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    for old in tcPr.findall(f'{{{_IA_W_NS}}}shd'):
+        tcPr.remove(old)
+    shd = etree.SubElement(tcPr, f'{{{_IA_W_NS}}}shd')
+    shd.set(f'{{{_IA_W_NS}}}val', 'clear')
+    shd.set(f'{{{_IA_W_NS}}}color', 'auto')
+    shd.set(f'{{{_IA_W_NS}}}fill', hex6.upper())
+
+
+def _ia_set_table_no_border(tbl):
+    tblPr = tbl._tbl.get_or_add_tblPr()
+    for old in tblPr.findall(f'{{{_IA_W_NS}}}tblBorders'):
+        tblPr.remove(old)
+    tblBorders = etree.SubElement(tblPr, f'{{{_IA_W_NS}}}tblBorders')
+    for side in ('top', 'left', 'bottom', 'right', 'insideH', 'insideV'):
+        el = etree.SubElement(tblBorders, f'{{{_IA_W_NS}}}{side}')
+        el.set(f'{{{_IA_W_NS}}}val', 'none')
+
+
+def _ia_set_table_full_width(tbl):
+    tblPr = tbl._tbl.get_or_add_tblPr()
+    tblW = tblPr.find(f'{{{_IA_W_NS}}}tblW')
+    if tblW is None:
+        tblW = etree.SubElement(tblPr, f'{{{_IA_W_NS}}}tblW')
+    tblW.set(f'{{{_IA_W_NS}}}w', '5000')
+    tblW.set(f'{{{_IA_W_NS}}}type', 'pct')
+
+
+def _ia_set_row_height(row, cm_val: float):
+    tr = row._tr
+    trPr = tr.get_or_add_trPr()
+    for old in trPr.findall(f'{{{_IA_W_NS}}}trHeight'):
+        trPr.remove(old)
+    trH = etree.SubElement(trPr, f'{{{_IA_W_NS}}}trHeight')
+    trH.set(f'{{{_IA_W_NS}}}val', str(int(cm_val * 567)))
+    trH.set(f'{{{_IA_W_NS}}}hRule', 'atLeast')
+
+
+def _ia_para_border(para, side: str, hex6: str, sz: int = 8, space: int = 1):
+    """Ajoute une bordure (top/bottom/left) à un paragraphe."""
+    pPr = para._p.get_or_add_pPr()
+    pBdr = pPr.find(f'{{{_IA_W_NS}}}pBdr')
+    if pBdr is None:
+        pBdr = etree.SubElement(pPr, f'{{{_IA_W_NS}}}pBdr')
+    for old in pBdr.findall(f'{{{_IA_W_NS}}}{side}'):
+        pBdr.remove(old)
+    el = etree.SubElement(pBdr, f'{{{_IA_W_NS}}}{side}')
+    el.set(f'{{{_IA_W_NS}}}val', 'single')
+    el.set(f'{{{_IA_W_NS}}}sz', str(sz))
+    el.set(f'{{{_IA_W_NS}}}space', str(space))
+    el.set(f'{{{_IA_W_NS}}}color', hex6.upper())
+
+
+def _ia_insert_page_field(para_elem):
+    """Insère un champ PAGE \\* MERGEFORMAT dans l'XML d'un paragraphe."""
+    W = _IA_W_NS
+    xml_space = '{http://www.w3.org/XML/1998/namespace}space'
+
+    def _r_with_rpr():
+        r = etree.Element(f'{{{W}}}r')
+        rPr = etree.SubElement(r, f'{{{W}}}rPr')
+        rf = etree.SubElement(rPr, f'{{{W}}}rFonts')
+        rf.set(f'{{{W}}}ascii', 'Arial'); rf.set(f'{{{W}}}hAnsi', 'Arial')
+        sz = etree.SubElement(rPr, f'{{{W}}}sz'); sz.set(f'{{{W}}}val', '16')
+        szcs = etree.SubElement(rPr, f'{{{W}}}szCs'); szcs.set(f'{{{W}}}val', '16')
+        clr = etree.SubElement(rPr, f'{{{W}}}color'); clr.set(f'{{{W}}}val', '808080')
+        i_el = etree.SubElement(rPr, f'{{{W}}}i')
+        ics = etree.SubElement(rPr, f'{{{W}}}iCs')
+        return r
+
+    r1 = _r_with_rpr(); para_elem.append(r1)
+    fc1 = etree.SubElement(r1, f'{{{W}}}fldChar')
+    fc1.set(f'{{{W}}}fldCharType', 'begin'); fc1.set(f'{{{W}}}dirty', '1')
+
+    r2 = _r_with_rpr(); para_elem.append(r2)
+    it = etree.SubElement(r2, f'{{{W}}}instrText')
+    it.set(xml_space, 'preserve'); it.text = ' PAGE \\* MERGEFORMAT '
+
+    r3 = _r_with_rpr(); para_elem.append(r3)
+    etree.SubElement(r3, f'{{{W}}}fldChar').set(f'{{{W}}}fldCharType', 'separate')
+
+    r4 = _r_with_rpr(); para_elem.append(r4)
+    t4 = etree.SubElement(r4, f'{{{W}}}t'); t4.text = '1'
+
+    r5 = _r_with_rpr(); para_elem.append(r5)
+    etree.SubElement(r5, f'{{{W}}}fldChar').set(f'{{{W}}}fldCharType', 'end')
+
+
+def _ia_setup_document(doc, devis: str):
+    """Configure A4, marges, en-tête et pied de page du rapport IA."""
+    W = _IA_W_NS
+    sec = doc.sections[0]
+    sec.page_width        = Cm(21.0)
+    sec.page_height       = Cm(29.7)
+    sec.left_margin       = Cm(2.5)
+    sec.right_margin      = Cm(2.0)
+    sec.top_margin        = Cm(2.5)
+    sec.bottom_margin     = Cm(2.0)
+    sec.header_distance   = Cm(1.2)
+    sec.footer_distance   = Cm(1.2)
+    sec.different_first_page_header_footer = True
+
+    # ── En-tête (pages 2+) ───────────────────────────────────────────
+    hdr = sec.header
+    hdr.is_linked_to_previous = False
+    for p in list(hdr.paragraphs):
+        p._element.getparent().remove(p._element)
+
+    p_hdr = hdr.add_paragraph()
+    p_hdr.paragraph_format.space_before = Pt(0)
+    p_hdr.paragraph_format.space_after  = Pt(3)
+    # Tab droite à ~14 cm
+    pPr_h = p_hdr._p.get_or_add_pPr()
+    tabs_h = etree.SubElement(pPr_h, f'{{{W}}}tabs')
+    t_h = etree.SubElement(tabs_h, f'{{{W}}}tab')
+    t_h.set(f'{{{W}}}val', 'right'); t_h.set(f'{{{W}}}pos', str(int(14 * 567)))
+
+    r_logo = p_hdr.add_run("IMMÉAU")
+    r_logo.bold = True; r_logo.font.name = "Arial"; r_logo.font.size = Pt(9)
+    r_logo.font.color.rgb = _ia_rgb(_IA_NAVY)
+
+    r_tab = p_hdr.add_run("\t")
+    r_tab.font.name = "Arial"; r_tab.font.size = Pt(8)
+
+    r_ref = p_hdr.add_run(f"Rapport d'investigations — Réf. {devis}")
+    r_ref.font.name = "Arial"; r_ref.font.size = Pt(8)
+    r_ref.font.color.rgb = _ia_rgb('808080')
+
+    _ia_para_border(p_hdr, 'bottom', _IA_BLUE, sz=6, space=1)
+
+    # ── Pied de page (pages 2+) ──────────────────────────────────────
+    ftr = sec.footer
+    ftr.is_linked_to_previous = False
+    for p in list(ftr.paragraphs):
+        p._element.getparent().remove(p._element)
+
+    p_ftr = ftr.add_paragraph()
+    p_ftr.paragraph_format.space_before = Pt(3)
+    p_ftr.paragraph_format.space_after  = Pt(0)
+    _ia_para_border(p_ftr, 'top', _IA_BLUE, sz=6, space=1)
+    # Tab droite
+    pPr_f = p_ftr._p.get_or_add_pPr()
+    tabs_f = etree.SubElement(pPr_f, f'{{{W}}}tabs')
+    t_f = etree.SubElement(tabs_f, f'{{{W}}}tab')
+    t_f.set(f'{{{W}}}val', 'right'); t_f.set(f'{{{W}}}pos', str(int(14 * 567)))
+
+    r_ft = p_ftr.add_run(f"Rapport d'investigations {devis}")
+    r_ft.italic = True; r_ft.font.name = "Arial"; r_ft.font.size = Pt(8)
+    r_ft.font.color.rgb = _ia_rgb('808080')
+
+    p_ftr.add_run("\t").font.name = "Arial"
+
+    r_pg = p_ftr.add_run("Page ")
+    r_pg.italic = True; r_pg.font.name = "Arial"; r_pg.font.size = Pt(8)
+    r_pg.font.color.rgb = _ia_rgb('808080')
+
+    _ia_insert_page_field(p_ftr._p)
 
 
 def _add_cover_ia(doc, data: dict):
-    """Crée la page de garde du rapport IA."""
-    adresse    = data.get("adresseProjet", "")
-    cp         = data.get("cpProjet", "")
-    ville      = data.get("villeProjet", "")
-    client_raw = data.get("client", "")
-    devis      = data.get("devis", "")
-    date_r     = data.get("dateRapport", "")
-    redacteur  = data.get("redacteur", "")
-    moe        = data.get("moe", "")
+    """Page de garde redesignée — palette Imméau, table structurée."""
+    adresse      = data.get("adresseProjet", "")
+    cp           = data.get("cpProjet", "")
+    ville        = data.get("villeProjet", "")
+    client_raw   = data.get("client", "")
+    devis        = data.get("devis", "")
+    date_r       = data.get("dateRapport", "")
+    redacteur    = data.get("redacteur", "")
+    verificateur = data.get("verificateur", "")
+    moe          = data.get("moe", "")
+    cp_moe       = data.get("cpMoe", "")
+    ville_moe    = data.get("villeMoe", "")
+    titre_etude  = data.get("titreEtude", "") or "Investigation et diagnostic des canalisations"
+
     adresse_full = _build_adresse_full(adresse, cp, ville)
+    client       = _strip_sdc_prefix(client_raw)
+    moe_loc      = f"{moe}" + (f" — {cp_moe} {ville_moe}".strip() if (cp_moe or ville_moe) else "")
 
-    # Titre
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run("RAPPORT D'INVESTIGATIONS ET DIAGNOSTIC")
-    r.bold = True; r.font.name = "Arial"; r.font.size = Pt(18)
-    doc.add_paragraph()
+    # ── Table principale : 1 colonne, 5 lignes ──────────────────────
+    tbl = doc.add_table(rows=5, cols=1)
+    _ia_set_table_no_border(tbl)
+    _ia_set_table_full_width(tbl)
 
-    p2 = doc.add_paragraph()
-    p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r2 = p2.add_run("DES CANALISATIONS EN CAVES ET SOUS-COURS")
-    r2.bold = True; r2.font.name = "Arial"; r2.font.size = Pt(16)
-    doc.add_paragraph()
+    # ─ Ligne 0 : Bandeau entreprise (navy) ──────────────────────────
+    _ia_set_row_height(tbl.rows[0], 2.8)
+    c0 = tbl.rows[0].cells[0]
+    _ia_set_cell_bg(c0, _IA_NAVY)
 
-    # Adresse
-    p3 = doc.add_paragraph()
-    p3.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r3 = p3.add_run(f"SDC DU {adresse_full.upper()}")
-    r3.bold = True; r3.font.name = "Arial"; r3.font.size = Pt(14)
+    p0a = c0.paragraphs[0]
+    p0a.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p0a.paragraph_format.space_before = Pt(18)
+    p0a.paragraph_format.space_after  = Pt(2)
+    r0a = p0a.add_run("IMMÉAU")
+    r0a.bold = True; r0a.font.name = "Arial"; r0a.font.size = Pt(26)
+    r0a.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
 
-    doc.add_paragraph()
-    doc.add_paragraph()
+    p0b = c0.add_paragraph()
+    p0b.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p0b.paragraph_format.space_before = Pt(0)
+    p0b.paragraph_format.space_after  = Pt(16)
+    r0b = p0b.add_run("83, rue de Reuilly  ·  75012 Paris  ·  www.immeau.fr")
+    r0b.font.name = "Arial"; r0b.font.size = Pt(9)
+    r0b.font.color.rgb = RGBColor(0xBD, 0xD7, 0xEE)
 
-    # Tableau info
-    tbl = doc.add_table(rows=4, cols=2)
-    tbl.style = "Table Grid"
-    cells = [
-        ("Référence devis", devis),
-        ("Date", date_r),
+    # ─ Ligne 1 : Titre rapport (blanc) ─────────────────────────────
+    _ia_set_row_height(tbl.rows[1], 3.5)
+    c1 = tbl.rows[1].cells[0]
+    _ia_set_cell_bg(c1, _IA_WHITE)
+
+    p1a = c1.paragraphs[0]
+    p1a.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p1a.paragraph_format.space_before = Pt(28)
+    p1a.paragraph_format.space_after  = Pt(4)
+    r1a = p1a.add_run("RAPPORT D'INVESTIGATIONS ET DIAGNOSTIC")
+    r1a.bold = True; r1a.font.name = "Arial"; r1a.font.size = Pt(17)
+    r1a.font.color.rgb = _ia_rgb(_IA_NAVY)
+
+    p1b = c1.add_paragraph()
+    p1b.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p1b.paragraph_format.space_before = Pt(0)
+    p1b.paragraph_format.space_after  = Pt(0)
+    r1b = p1b.add_run("des canalisations en caves et sous-cours")
+    r1b.font.name = "Arial"; r1b.font.size = Pt(12)
+    r1b.font.color.rgb = _ia_rgb(_IA_BLUE)
+
+    # ─ Ligne 2 : Adresse projet (bleu clair) ───────────────────────
+    _ia_set_row_height(tbl.rows[2], 2.5)
+    c2 = tbl.rows[2].cells[0]
+    _ia_set_cell_bg(c2, _IA_LCYAN)
+
+    p2a = c2.paragraphs[0]
+    p2a.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p2a.paragraph_format.space_before = Pt(14)
+    p2a.paragraph_format.space_after  = Pt(2)
+    r2_sdc = p2a.add_run("SDC DU ")
+    r2_sdc.font.name = "Arial"; r2_sdc.font.size = Pt(11)
+    r2_sdc.font.color.rgb = _ia_rgb(_IA_NAVY)
+    r2_adr = p2a.add_run(adresse_full.upper())
+    r2_adr.bold = True; r2_adr.font.name = "Arial"; r2_adr.font.size = Pt(13)
+    r2_adr.font.color.rgb = _ia_rgb(_IA_NAVY)
+
+    if client:
+        p2b = c2.add_paragraph()
+        p2b.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p2b.paragraph_format.space_before = Pt(4)
+        p2b.paragraph_format.space_after  = Pt(12)
+        r2b = p2b.add_run(client)
+        r2b.font.name = "Arial"; r2b.font.size = Pt(10)
+        r2b.font.color.rgb = _ia_rgb(_IA_BLUE)
+
+    # ─ Ligne 3 : Informations projet (blanc) ───────────────────────
+    c3 = tbl.rows[3].cells[0]
+    _ia_set_cell_bg(c3, _IA_WHITE)
+
+    info_items = [
+        ("Réf. devis", devis),
+        ("Date du rapport", date_r),
         ("Rédacteur", redacteur),
-        ("Maître d'œuvre", moe),
     ]
-    for i, (label, value) in enumerate(cells):
-        tbl.rows[i].cells[0].paragraphs[0].add_run(label).bold = True
-        tbl.rows[i].cells[0].paragraphs[0].runs[0].font.name = "Arial"
-        tbl.rows[i].cells[0].paragraphs[0].runs[0].font.size = Pt(11)
-        tbl.rows[i].cells[1].paragraphs[0].add_run(value or "")
-        tbl.rows[i].cells[1].paragraphs[0].runs[0].font.name = "Arial"
-        tbl.rows[i].cells[1].paragraphs[0].runs[0].font.size = Pt(11)
+    if verificateur:
+        info_items.append(("Vérificateur", verificateur))
+    if moe:
+        info_items.append(("Maître d'œuvre", moe_loc))
+
+    p3_sp = c3.paragraphs[0]
+    p3_sp.paragraph_format.space_before = Pt(14)
+    p3_sp.paragraph_format.space_after  = Pt(0)
+
+    for label, value in info_items:
+        pi = c3.add_paragraph()
+        pi.paragraph_format.space_before = Pt(5)
+        pi.paragraph_format.space_after  = Pt(5)
+        pi.paragraph_format.left_indent  = Cm(1.5)
+        rl = pi.add_run(f"{label} : ")
+        rl.bold = True; rl.font.name = "Arial"; rl.font.size = Pt(10)
+        rl.font.color.rgb = _ia_rgb(_IA_NAVY)
+        rv = pi.add_run(value or "—")
+        rv.font.name = "Arial"; rv.font.size = Pt(10)
+
+    p3_end = c3.add_paragraph()
+    p3_end.paragraph_format.space_before = Pt(10)
+    p3_end.paragraph_format.space_after  = Pt(0)
+
+    # ─ Ligne 4 : Objet + pied (gris clair / navy) ──────────────────
+    _ia_set_row_height(tbl.rows[4], 1.6)
+    c4 = tbl.rows[4].cells[0]
+    _ia_set_cell_bg(c4, _IA_NAVY)
+
+    p4a = c4.paragraphs[0]
+    p4a.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p4a.paragraph_format.space_before = Pt(8)
+    p4a.paragraph_format.space_after  = Pt(4)
+    r4a = p4a.add_run(titre_etude)
+    r4a.italic = True; r4a.font.name = "Arial"; r4a.font.size = Pt(10)
+    r4a.font.color.rgb = RGBColor(0xBD, 0xD7, 0xEE)
+
+    p4b = c4.add_paragraph()
+    p4b.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p4b.paragraph_format.space_before = Pt(0)
+    p4b.paragraph_format.space_after  = Pt(8)
+    r4b = p4b.add_run(f"Réf. {devis}   ·   Document confidentiel")
+    r4b.font.name = "Arial"; r4b.font.size = Pt(8)
+    r4b.font.color.rgb = RGBColor(0x7F, 0xA5, 0xC8)
 
     doc.add_page_break()
 
 
+def _add_sommaire_ia(doc, has_photos: bool, has_bpe: bool):
+    """Page SOMMAIRE dynamique."""
+    # Titre dans un bandeau navy
+    tbl_s = doc.add_table(rows=1, cols=1)
+    _ia_set_table_no_border(tbl_s)
+    _ia_set_table_full_width(tbl_s)
+    _ia_set_row_height(tbl_s.rows[0], 1.4)
+    cs = tbl_s.rows[0].cells[0]
+    _ia_set_cell_bg(cs, _IA_NAVY)
+
+    ps = cs.paragraphs[0]
+    ps.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    ps.paragraph_format.space_before = Pt(10)
+    ps.paragraph_format.space_after  = Pt(10)
+    ps.paragraph_format.left_indent  = Cm(0.5)
+    rs = ps.add_run("SOMMAIRE")
+    rs.bold = True; rs.font.name = "Arial"; rs.font.size = Pt(16)
+    rs.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+
+    # Espace
+    sp = doc.add_paragraph()
+    sp.paragraph_format.space_before = Pt(10)
+    sp.paragraph_format.space_after  = Pt(4)
+
+    # Liste des sections
+    entries = [
+        ("PRÉAMBULE", ""),
+        ("I –", "Objet de la mission"),
+        ("II –", "Description du site"),
+        ("III –", "Géologie in situ"),
+        ("IV –", "Canalisations inspectées"),
+        ("V –", "Conclusions"),
+    ]
+    if has_photos:
+        entries.append(("VI –", "Complément photographique"))
+    entries.append(("VII –", "Conditions de travaux"))
+    entries.append(("VIII –", "Entretien du réseau"))
+
+    for i, (num, titre) in enumerate(entries):
+        pe = doc.add_paragraph()
+        pe.paragraph_format.space_before = Pt(6)
+        pe.paragraph_format.space_after  = Pt(6)
+        pe.paragraph_format.left_indent  = Cm(0.5)
+        rn = pe.add_run(num)
+        rn.bold = True; rn.font.name = "Arial"; rn.font.size = Pt(11)
+        rn.font.color.rgb = _ia_rgb(_IA_NAVY)
+        if titre:
+            pe.add_run("  ").font.name = "Arial"
+            rt = pe.add_run(titre)
+            rt.font.name = "Arial"; rt.font.size = Pt(11)
+        # Séparateur léger entre entrées
+        if i < len(entries) - 1:
+            _ia_para_border(pe, 'bottom', 'DDDDDD', sz=2, space=1)
+
+    doc.add_page_break()
+
+
+def _add_heading_ia(doc, text: str, level: int = 1):
+    """Titre redesigné:
+    Niveau 1 : texte navy gras + ligne bleue en bas + espacement généreux.
+    Niveau 2 : barre bleue à gauche + texte bleu gras, indenté.
+    """
+    p = doc.add_paragraph()
+    if level == 1:
+        p.paragraph_format.space_before = Pt(20)
+        p.paragraph_format.space_after  = Pt(8)
+        p.paragraph_format.keep_with_next = True
+        run = p.add_run(text)
+        run.bold = True; run.font.name = "Arial"; run.font.size = Pt(13)
+        run.font.color.rgb = _ia_rgb(_IA_NAVY)
+        _ia_para_border(p, 'bottom', _IA_BLUE, sz=6, space=2)
+    else:
+        p.paragraph_format.space_before = Pt(12)
+        p.paragraph_format.space_after  = Pt(6)
+        p.paragraph_format.left_indent  = Cm(0.5)
+        p.paragraph_format.keep_with_next = True
+        run = p.add_run(text)
+        run.bold = True; run.font.name = "Arial"; run.font.size = Pt(11)
+        run.font.color.rgb = _ia_rgb(_IA_BLUE)
+        _ia_para_border(p, 'left', _IA_BLUE, sz=18, space=6)
+    return p
+
+
+def _add_body_ia(doc, text: str, bold: bool = False):
+    """Corps de texte : Arial 11, justifié."""
+    if not text.strip():
+        return None
+    p = doc.add_paragraph()
+    run = p.add_run(text.strip())
+    run.font.name = "Arial"; run.font.size = Pt(11)
+    run.bold = bold
+    p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after  = Pt(7)
+    return p
+
+
+def _add_bullet_ia(doc, text: str):
+    """Puce redesignée : tiret bleu + texte, indenté."""
+    p = doc.add_paragraph()
+    r_puce = p.add_run("–  ")
+    r_puce.bold = True; r_puce.font.name = "Arial"; r_puce.font.size = Pt(11)
+    r_puce.font.color.rgb = _ia_rgb(_IA_BLUE)
+    r_txt = p.add_run(text.strip())
+    r_txt.font.name = "Arial"; r_txt.font.size = Pt(11)
+    p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    p.paragraph_format.left_indent  = Cm(0.7)
+    p.paragraph_format.first_line_indent = Cm(-0.4)
+    p.paragraph_format.space_before = Pt(2)
+    p.paragraph_format.space_after  = Pt(5)
+
+
 def _add_photo_tables_ia(doc, photos_commentees: list):
-    """Insère les photos dans un tableau 2 colonnes (même logique que template)."""
+    """Tableau photos 2 colonnes, sans titre (appelé après _add_heading_ia)."""
     if not photos_commentees:
         return
-    _add_heading_ia(doc, "VI – COMPLÉMENT PHOTOGRAPHIQUE", level=1)
     n = len(photos_commentees)
     rows = (n + 1) // 2
     tbl = doc.add_table(rows=rows, cols=2)
-    tbl.style = "Table Grid"
+    _ia_set_table_no_border(tbl)
+    _ia_set_table_full_width(tbl)
     idx = 0
     for row in tbl.rows:
         for cell in row.cells:
             if idx >= n:
+                # Cellule vide : fond gris clair
+                _ia_set_cell_bg(cell, _IA_LGRAY)
                 break
             photo = photos_commentees[idx]
             img_b64 = photo.get("image_base64", "")
             comment = photo.get("commentaire", "")
+            _ia_set_cell_bg(cell, _IA_LGRAY)
             if img_b64:
                 try:
                     para = cell.paragraphs[0]
                     para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    para.paragraph_format.space_before = Pt(6)
+                    para.paragraph_format.space_after  = Pt(4)
                     run = para.add_run()
-                    run.add_picture(io.BytesIO(base64.b64decode(img_b64)), height=Cm(9.0))
+                    run.add_picture(io.BytesIO(base64.b64decode(img_b64)), height=Cm(8.5))
                 except Exception as e:
                     print(f"[WARN] Photo IA: {e}")
             if comment:
-                cp = cell.add_paragraph(comment)
+                cp = cell.add_paragraph()
                 cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                for r in cp.runs:
-                    r.italic = True; r.font.name = "Arial"; r.font.size = Pt(10)
+                cp.paragraph_format.space_before = Pt(2)
+                cp.paragraph_format.space_after  = Pt(8)
+                rc = cp.add_run(comment)
+                rc.italic = True; rc.font.name = "Arial"; rc.font.size = Pt(9)
+                rc.font.color.rgb = _ia_rgb('505050')
             idx += 1
 
 
@@ -1866,15 +2223,14 @@ Retourne EXACTEMENT ce JSON (toutes les clés, textes en français, style rappor
     # ── Assemblage du document Word ────────────────────────────────────
     doc = Document()
 
-    # Marges
-    for section in doc.sections:
-        section.top_margin    = Cm(2.5)
-        section.bottom_margin = Cm(2.5)
-        section.left_margin   = Cm(2.5)
-        section.right_margin  = Cm(2.5)
+    # Mise en page, marges, en-tête, pied de page
+    _ia_setup_document(doc, devis)
 
     # ── Page de garde ──────────────────────────────────────────────────
     _add_cover_ia(doc, data)
+
+    # ── SOMMAIRE ────────────────────────────────────────────────────────
+    _add_sommaire_ia(doc, has_photos=bool(photo_facade or photos), has_bpe=bpe_present)
 
     # ── PRÉAMBULE (statique) ───────────────────────────────────────────
     _add_heading_ia(doc, "PRÉAMBULE", level=1)
