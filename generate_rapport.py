@@ -2487,6 +2487,30 @@ def generer_rapport_ia():
     })
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Keep-alive : empêche Render free tier de mettre le serveur en veille.
+# Un thread tourne en arrière-plan et fait un GET /health toutes les 10 min.
+# ─────────────────────────────────────────────────────────────────────────────
+def _keepalive_loop():
+    import time
+    # Attendre le démarrage complet avant le premier ping
+    time.sleep(60)
+    health_url = os.environ.get(
+        "RENDER_EXTERNAL_URL",
+        "https://immeau-rapport-backend.onrender.com"
+    ).rstrip("/") + "/health"
+    while True:
+        try:
+            req_lib.get(health_url, timeout=20)
+        except Exception:
+            pass  # On ignore les erreurs réseau
+        time.sleep(600)  # 10 minutes
+
+
+_keepalive_thread = threading.Thread(target=_keepalive_loop, daemon=True)
+_keepalive_thread.start()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
